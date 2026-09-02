@@ -6,8 +6,9 @@ ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
-RUN useradd --system --uid 10001 app && mkdir -p /data && chown app:app /data
-USER app
+RUN groupadd --system --gid 10001 app && useradd --system --uid 10001 --gid app app && mkdir -p /data && chown app:app /data
+
 EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=3)"
+ENTRYPOINT ["python", "/app/docker-entrypoint.py"]
 CMD ["python", "app.py"]

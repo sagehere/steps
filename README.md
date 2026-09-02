@@ -1,4 +1,4 @@
-﻿# Zepp Life 多账户步数计划
+# Zepp Life 多账户步数计划
 
 一个适合部署在 VPS 上的私有管理网站。支持多个 Zepp Life 账户、批量执行、固定或随机步数、每日多时间点计划、失败重试和执行记录。
 
@@ -18,7 +18,7 @@ ghcr.io/sagehere/zepp-steps:latest
 
 - 1 核 CPU、512 MB 内存。
 - 已安装 Docker 和 Docker Compose。
-- 一个未被其他程序占用的端口，示例使用 `8000`。
+- 一个未被其他程序占用的端口，示例使用 `8000`（也可改为 `101:8000`）。
 
 先登录 VPS，检查 Docker：
 
@@ -105,13 +105,13 @@ docker compose logs --tail=100
 浏览器访问：
 
 ```text
-http://你的VPS公网IP:8000
+http://你的VPS公网IP:8000（若 Compose 使用 `101:8000`，则访问 `http://你的VPS公网IP:101`）
 ```
 
 使用 `.env` 中的 `ADMIN_PASSWORD` 登录。如果 VPS 启用了防火墙，需要放行端口：
 
 ```bash
-sudo ufw allow 8000/tcp
+sudo ufw allow 8000/tcp  # 使用 101:8000 时改为 101/tcp
 ```
 
 建议正式使用时通过 Nginx、Caddy 或宝塔反向代理配置 HTTPS，然后把 `COOKIE_SECURE` 改成 `true` 并重启容器。
@@ -126,6 +126,20 @@ sudo ufw allow 8000/tcp
 
 时间点填写的是“当天累计总步数”，不是增加多少步。后一时间点不能低于前一时间点，防止步数倒退。VPS 错过执行时间后，只补跑当天最新的到期目标。
 
+
+
+## 数据目录权限错误
+
+如果旧镜像日志出现 `sqlite3.OperationalError: unable to open database file`，这是宿主机的 `./data` 挂载目录覆盖了镜像内权限设置所致。升级到包含此修复的镜像即可，**不要删除 `data`，也不需要手动修改已有数据库**：
+
+```bash
+cd /opt/steps
+docker compose pull
+docker compose up -d
+docker compose logs --tail=100
+```
+
+新镜像会在启动时仅以 root 修复 `/data` 及其中已有文件的所有者为 UID/GID `10001`，随后立即降权为 `app` 用户运行网站。`/data` 必须是本应用专用的挂载目录；不要将其他重要目录挂载到这里。
 ## 六、更新、备份和卸载
 
 更新到最新镜像：
