@@ -1,0 +1,176 @@
+# Zepp Life 多账户步数计划
+
+一个适合部署在 VPS 上的私有管理网站。支持多个 Zepp Life 账户、批量执行、固定或随机步数、每日多时间点计划、失败重试和执行记录。
+
+Docker 镜像只发布到 GitHub Container Registry：
+
+```text
+ghcr.io/sagehere/steps:latest
+```
+
+镜像同时支持常见的 `linux/amd64`（Intel/AMD VPS）和 `linux/arm64`（ARM VPS、甲骨文 ARM 等）平台，Docker 会自动选择正确版本。
+
+> 本项目仅支持 Zepp Life 账号密码，不支持小米账号 SSO 或验证码登录。新账号通常需要先在 Zepp Life 中绑定有效设备。上游接口可能变更或限流，请勿用于公开服务。
+
+## 一、准备 VPS
+
+以下教程以 Ubuntu/Debian 为例。建议至少准备：
+
+- 1 核 CPU、512 MB 内存。
+- 已安装 Docker 和 Docker Compose。
+- 一个未被其他程序占用的端口，示例使用 `8000`。
+
+先登录 VPS，检查 Docker：
+
+```bash
+docker --version
+docker compose version
+```
+
+如果提示找不到命令，请按照 [Docker 官方安装教程](https://docs.docker.com/engine/install/) 安装 Docker Engine，再继续下面步骤。
+
+## 二、下载部署配置
+
+创建目录并下载两个配置文件：
+
+```bash
+sudo mkdir -p /opt/steps
+sudo chown "$USER":"$USER" /opt/steps
+cd /opt/steps
+
+curl -O https://raw.githubusercontent.com/sagehere/steps/main/docker-compose.yml
+curl -o .env https://raw.githubusercontent.com/sagehere/steps/main/.env.example
+mkdir -p data
+```
+
+如果没有 `curl`，可以先安装：
+
+```bash
+sudo apt update
+sudo apt install -y curl
+```
+
+## 三、生成密钥并修改配置
+
+生成随机应用密钥：
+
+```bash
+openssl rand -hex 32
+```
+
+复制输出结果，然后编辑 `.env`：
+
+```bash
+nano .env
+```
+
+配置示例：
+
+```dotenv
+ADMIN_PASSWORD=请换成一个强管理密码
+APP_SECRET=粘贴刚才生成的64位随机字符串
+TZ=Asia/Shanghai
+REQUEST_INTERVAL_SECONDS=5
+COOKIE_SECURE=false
+```
+
+保存方法：按 `Ctrl+O`、回车，再按 `Ctrl+X`。
+
+配置项说明：
+
+| 配置 | 说明 |
+| --- | --- |
+| `ADMIN_PASSWORD` | 网站管理员登录密码，必须修改。 |
+| `APP_SECRET` | 加密账户密码和登录状态的密钥，至少 32 字符，必须备份且不能随意更换。 |
+| `TZ` | 计划时区，国内用户保持 `Asia/Shanghai`。 |
+| `REQUEST_INTERVAL_SECONDS` | 多账户提交间隔，默认 5 秒；账户很多或出现 429 时适当增大。 |
+| `COOKIE_SECURE` | 直接使用 IP 和 HTTP 时设为 `false`；配置 HTTPS 后改为 `true`。 |
+
+## 四、启动网站
+
+在 `/opt/steps` 目录运行：
+
+```bash
+docker compose pull
+docker compose up -d
+```
+
+查看状态：
+
+```bash
+docker compose ps
+docker compose logs --tail=100
+```
+
+浏览器访问：
+
+```text
+http://你的VPS公网IP:8000
+```
+
+使用 `.env` 中的 `ADMIN_PASSWORD` 登录。如果 VPS 启用了防火墙，需要放行端口：
+
+```bash
+sudo ufw allow 8000/tcp
+```
+
+建议正式使用时通过 Nginx、Caddy 或宝塔反向代理配置 HTTPS，然后把 `COOKIE_SECURE` 改成 `true` 并重启容器。
+
+## 五、第一次使用
+
+1. 打开“计划”，新建一个每日计划。
+2. 添加时间点，例如 `08:00 → 3000`、`12:00 → 7000–8500`、`22:00 → 18000`。
+3. 打开“账户”，逐个添加或按每行 `账号,密码,备注` 批量导入。
+4. 给账户分配计划，先点击“测试”确认可以登录。
+5. 可勾选多个账户手动执行；自动计划会在后台每日运行。
+
+时间点填写的是“当天累计总步数”，不是增加多少步。后一时间点不能低于前一时间点，防止步数倒退。VPS 错过执行时间后，只补跑当天最新的到期目标。
+
+## 六、更新、备份和卸载
+
+更新到最新镜像：
+
+```bash
+cd /opt/steps
+docker compose pull
+docker compose up -d
+```
+
+数据库保存在 `/opt/steps/data/app.db`。备份前先停止服务，复制数据库，再启动：
+
+```bash
+cd /opt/steps
+docker compose down
+cp data/app.db "data/app.db.backup-$(date +%F)"
+docker compose up -d
+```
+
+恢复时停止服务，用备份文件覆盖 `data/app.db` 后重新启动。恢复数据库时必须同时使用原来的 `APP_SECRET`，否则已保存的账户密码无法解密。
+
+停止或卸载：
+
+```bash
+cd /opt/steps
+docker compose down
+```
+
+该命令不会删除 `data` 目录。确认不再需要数据后再手动删除 `/opt/steps`。
+
+## 七、镜像发布说明
+
+每次代码推送到 `main` 后，GitHub Actions 会先运行测试，再构建 `linux/amd64` 和 `linux/arm64` 镜像，只推送到 GHCR。发布标签包括：
+
+- `latest`：`main` 分支最新成功版本。
+- `sha-xxxxxxx`：与某次 Git 提交对应，适合固定版本。
+- `1.2.3`、`1.2`：推送 `v1.2.3` Git 标签时生成。
+
+仓库管理员首次构建完成后，需要进入 GitHub 仓库右侧 **Packages → steps → Package settings → Change visibility**，将镜像设为 **Public**。否则 VPS 拉取私有镜像时需要额外配置 GitHub Token。
+
+## 开发验证
+
+```bash
+python -m pip install -r requirements.txt
+python -m unittest -v
+```
+
+Zepp Life 协议工具源自 [TonyJiangWJ/mimotion](https://github.com/TonyJiangWJ/mimotion)，按 Apache-2.0 许可证使用，完整许可见 [LICENSE](LICENSE)。
