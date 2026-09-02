@@ -13,7 +13,7 @@ from vendor.util.aes_help import encrypt_data, HM_AES_KEY, HM_AES_IV
 
 
 # 通过账号密码获取access_token和refresh_token 但是refresh_token不知道怎么使用
-def login_access_token(user, password) -> (str | None, str | None):
+def login_access_token(user, password, client=requests) -> (str | None, str | None):
     headers = {
         "content-type": "application/x-www-form-urlencoded; charset=UTF-8",
         "user-agent": "MiFit6.14.0 (M2007J1SC; Android 12; Density/2.75)",
@@ -39,7 +39,7 @@ def login_access_token(user, password) -> (str | None, str | None):
     cipher_data = encrypt_data(plaintext, HM_AES_KEY, HM_AES_IV)
 
     url1 = 'https://api-user.zepp.com/v2/registrations/tokens'
-    r1 = requests.post(url1, data=cipher_data, headers=headers, allow_redirects=False, timeout=5)
+    r1 = client.post(url1, data=cipher_data, headers=headers, allow_redirects=False, timeout=5)
     if r1.status_code != 303:
         return None, "登录异常，status: %d" % r1.status_code
     try:
@@ -88,7 +88,7 @@ def get_time():
 
 
 # 获取login_token，app_token，userid
-def grant_login_tokens(access_token, device_id, is_phone=False) -> (str | None, str | None, str | None, str | None):
+def grant_login_tokens(access_token, device_id, is_phone=False, client=requests) -> (str | None, str | None, str | None, str | None):
     url = "https://account.huami.com/v2/client/login"
     headers = {
         "app_name": "com.xiaomi.hm.health",
@@ -127,7 +127,7 @@ def grant_login_tokens(access_token, device_id, is_phone=False) -> (str | None, 
             "source": "com.xiaomi.hm.health:6.14.0:50818",
             "third_name": "email",
         }
-    resp = requests.post(url, data=data, headers=headers, timeout=10).json()
+    resp = client.post(url, data=data, headers=headers, timeout=10).json()
     _login_token, _userid, _app_token = None, None, None
     try:
         result = resp.get("result")
@@ -142,10 +142,10 @@ def grant_login_tokens(access_token, device_id, is_phone=False) -> (str | None, 
 
 
 # 获取app_token 用于提交数据变更
-def grant_app_token(login_token: str) -> (str | None, str | None):
+def grant_app_token(login_token: str, client=requests) -> (str | None, str | None):
     url = f"https://account-cn.huami.com/v1/client/app_tokens?app_name=com.xiaomi.hm.health&dn=api-user.huami.com%2Capi-mifit.huami.com%2Capp-analytics.huami.com&login_token={login_token}"
     headers = {'User-Agent': 'MiFit/5.3.0 (iPhone; iOS 14.7.1; Scale/3.00)'}
-    resp = requests.get(url, headers=headers, timeout=10)
+    resp = client.get(url, headers=headers, timeout=10)
     if resp.status_code != 200:
         return None, "请求异常：%d" % resp.status_code
     resp = resp.json()
@@ -158,7 +158,7 @@ def grant_app_token(login_token: str) -> (str | None, str | None):
 
 
 # 获取用户信息 主要用于检查app_token是否有效
-def check_app_token(app_token) -> (bool, str | None):
+def check_app_token(app_token, client=requests) -> (bool, str | None):
     url = "https://api-mifit-cn3.zepp.com/huami.health.getUserInfo.json"
 
     params = {
@@ -192,7 +192,7 @@ def check_app_token(app_token) -> (bool, str | None):
         "lang": "zh_CN",
         "clientid": "428135909242707968"
     }
-    response = requests.get(url, params=params, headers=headers, timeout=10)
+    response = client.get(url, params=params, headers=headers, timeout=10)
     if response.status_code != 200:
         return False, "请求异常：%d" % response.status_code
     response = response.json()
@@ -203,7 +203,7 @@ def check_app_token(app_token) -> (bool, str | None):
         return False, message
 
 
-def renew_login_token(login_token) -> (str | None, str | None):
+def renew_login_token(login_token, client=requests) -> (str | None, str | None):
     url = "https://account-cn3.zepp.com/v1/client/renew_login_token"
     params = {
         "os_version": "v0.8.1",
@@ -225,7 +225,7 @@ def renew_login_token(login_token) -> (str | None, str | None):
         "appplatform": "android_phone"
     }
 
-    resp = requests.get(url, params=params, headers=headers, timeout=10)
+    resp = client.get(url, params=params, headers=headers, timeout=10)
     if resp.status_code != 200:
         return None, "请求异常：%d" % resp.status_code
     resp = resp.json()
@@ -238,14 +238,14 @@ def renew_login_token(login_token) -> (str | None, str | None):
 
 
 # 查询用户在华米云端绑定的手环/手表设备ID
-def get_user_device_id(app_token, userid) -> str | None:
+def get_user_device_id(app_token, userid, client=requests) -> str | None:
     url = f"https://api-mifit-cn.huami.com/v1/device/binds.json?userid={userid}"
     headers = {
         "apptoken": app_token,
         "User-Agent": "MiFit6.14.0 (M2007J1SC; Android 12; Density/2.75)"
     }
     try:
-        resp = requests.get(url, headers=headers, timeout=5).json()
+        resp = client.get(url, headers=headers, timeout=5).json()
         items = resp.get("items", [])
         if items:
             # 1. 优先匹配 deviceType == 0 (手环/手表)
@@ -266,7 +266,7 @@ def get_user_device_id(app_token, userid) -> str | None:
     return None
 
 
-def post_fake_brand_data(step, app_token, userid, device_id=None):
+def post_fake_brand_data(step, app_token, userid, device_id=None, client=requests):
     t = get_time()
 
     # 提交日期必须用北京时间：GitHub Actions的runner是UTC时区，跨北京时间0点执行时UTC日期还是前一天，会把步数写错天
@@ -291,7 +291,7 @@ def post_fake_brand_data(step, app_token, userid, device_id=None):
 
     data = f'userid={userid}&last_sync_data_time=1597306380&device_type=0&last_deviceid={target_dev_id}&data_json={data_json}'
 
-    response = requests.post(url, data=data, headers=head, timeout=10)
+    response = client.post(url, data=data, headers=head, timeout=10)
     if response.status_code != 200:
         return False, "请求修改步数异常：%d" % response.status_code
     response = response.json()
