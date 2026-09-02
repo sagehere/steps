@@ -1,7 +1,7 @@
 import tempfile
 import unittest
 import warnings
-from app import create_app, minute, parse_target, utcnow
+from app import create_app, localtime, minute, parse_target, utcnow
 
 class AppTests(unittest.TestCase):
     def setUp(self):
@@ -23,6 +23,7 @@ class AppTests(unittest.TestCase):
         with warnings.catch_warnings():
             warnings.simplefilter('error', DeprecationWarning)
             self.assertRegex(utcnow(), r'^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}$')
+        self.assertEqual(localtime('2026-09-02T00:00:00', 'Asia/Shanghai'), '2026-09-02 08:00:00')
     def test_plan_monotonicity_and_schedule_dedupe(self):
         self.login()
         token = self.app.get('/plans').data.decode().split("name=csrf value='")[1].split("'")[0]
@@ -30,11 +31,34 @@ class AppTests(unittest.TestCase):
         app = self.app.application
         with app.extensions['store'].conn() as c: pid = c.execute('SELECT id FROM plans').fetchone()[0]
         self.app.post(f'/plans/{pid}', data={'csrf':token, 'at':'00:00', 'low':'3000'})
+        self.app.post(f'/plans/{pid}', data={'csrf':token, 'at':'06:00', 'low':'4000', 'high':'5000'})
+        detail = self.app.get(f'/plans/{pid}')
+        self.assertEqual(detail.status_code, 200)
+        self.assertIn('4000 – 5000', detail.data.decode())
         self.app.post(f'/plans/{pid}', data={'csrf':token, 'at':'12:00', 'low':'2000'})
         with app.extensions['store'].conn() as c:
-            self.assertEqual(c.execute('SELECT count(*) FROM plan_points').fetchone()[0], 1)
+            self.assertEqual(c.execute('SELECT count(*) FROM plan_points').fetchone()[0], 2)
             c.execute("INSERT INTO accounts(username,note,secret,plan_id,created_at,updated_at) VALUES(?,?,?,?,?,?)", ('one@x.com','',app.extensions['store'].seal({'username':'one@x.com','password':'p'}),pid,'now','now'))
         app.extensions['runner'].enqueue_scheduled(); app.extensions['runner'].enqueue_scheduled()
         with app.extensions['store'].conn() as c: self.assertEqual(c.execute("SELECT count(*) FROM tasks WHERE trigger='计划'").fetchone()[0], 1)
+
+    def test_plan_can_be_deleted_from_list(self):
+        self.login()
+        page = self.app.get('/plans').data.decode(); token = page.split("name=csrf value='")[1].split("'")[0]
+        self.app.post('/plans', data={'csrf':token, 'name':'待删除'})
+        app = self.app.application
+        with app.extensions['store'].conn() as c: pid = c.execute('SELECT id FROM plans').fetchone()[0]
+        page = self.app.get('/plans').data.decode()
+        self.assertIn(f"action='/plans/{pid}/delete'", page)
+        self.app.post(f'/plans/{pid}/delete', data={'csrf':token})
+        with app.extensions['store'].conn() as c: self.assertEqual(c.execute('SELECT count(*) FROM plans').fetchone()[0], 0)
+
+    def test_history_uses_configured_timezone(self):
+        self.login(); app = self.app.application
+        with app.extensions['store'].conn() as c:
+            c.execute("INSERT INTO tasks(account_label,trigger,state,available_at,created_at) VALUES('***','测试','success',?,?)", ('2026-09-02T00:00:00', '2026-09-02T00:00:00'))
+        page = self.app.get('/history').data.decode()
+        self.assertIn('时间（Asia/Shanghai）', page)
+        self.assertIn('2026-09-02 08:00:00', page)
 
 if __name__ == '__main__': unittest.main()

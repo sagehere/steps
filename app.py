@@ -40,6 +40,9 @@ body{font:15px system-ui,sans-serif;margin:auto;max-width:1100px;padding:18px;co
 {% with m=get_flashed_messages() %}{% for x in m %}<div class=flash>{{x}}</div>{% endfor %}{% endwith %}{{body|safe}}</html>"""
 
 def utcnow(delay=0): return (datetime.now(UTC) + timedelta(seconds=delay)).replace(tzinfo=None, microsecond=0).isoformat()
+def localtime(value, tz):
+    if not value: return ''
+    return datetime.fromisoformat(value).replace(tzinfo=UTC).astimezone(ZoneInfo(tz)).strftime('%Y-%m-%d %H:%M:%S')
 def mask(value):
     value = str(value); n = max(1, len(value) // 3)
     return value[:n] + "***" + value[-n:]
@@ -159,7 +162,7 @@ def create_app(config=None):
         if 'csrf' not in session: session['csrf'] = secrets.token_urlsafe(24)
         return session['csrf']
     @app.context_processor
-    def inject(): return {'csrf': csrf(), 'clock': clock, 'mask': mask}
+    def inject(): return {'csrf': csrf(), 'clock': clock, 'mask': mask, 'localtime': lambda value: localtime(value, app.config['TZ']), 'timezone': app.config['TZ']}
     @app.before_request
     def verify_csrf():
         if request.method == 'POST' and request.endpoint not in ('login', 'health') and request.form.get('csrf') != session.get('csrf'): abort(400, 'CSRF 校验失败')
@@ -188,8 +191,11 @@ def create_app(config=None):
     @app.get('/')
     @required
     def dashboard():
+        local_midnight = datetime.now(runner.tz).replace(hour=0, minute=0, second=0, microsecond=0)
+        day_start = local_midnight.astimezone(UTC).replace(tzinfo=None).isoformat()
+        day_end = (local_midnight + timedelta(days=1)).astimezone(UTC).replace(tzinfo=None).isoformat()
         with store.conn() as c:
-            stats=c.execute("SELECT (SELECT count(*) FROM accounts WHERE enabled=1) accounts,(SELECT count(*) FROM plans WHERE enabled=1) plans,(SELECT count(*) FROM tasks WHERE state='queued') queued,(SELECT count(*) FROM tasks WHERE state='failed' AND date(finished_at)=date('now')) failed").fetchone(); recent=c.execute("SELECT * FROM tasks ORDER BY id DESC LIMIT 12").fetchall()
+            stats=c.execute("SELECT (SELECT count(*) FROM accounts WHERE enabled=1) accounts,(SELECT count(*) FROM plans WHERE enabled=1) plans,(SELECT count(*) FROM tasks WHERE state='queued') queued,(SELECT count(*) FROM tasks WHERE state='failed' AND finished_at>=? AND finished_at<?) failed", (day_start, day_end)).fetchone(); recent=c.execute("SELECT * FROM tasks ORDER BY id DESC LIMIT 12").fetchall()
         return page("<div class='grid'>{% for k,v in stats.items() %}<div class=card><b>{{k}}</b><h2>{{v}}</h2></div>{% endfor %}</div><div class=card><h2>最近任务</h2>{% include 'none' ignore missing %}<table><tr><th>账户</th><th>来源</th><th>目标</th><th>状态</th><th>错误</th></tr>{% for t in recent %}<tr><td>{{t.account_label}}</td><td>{{t.trigger}}</td><td>{{t.target_steps or '-'}}</td><td>{{t.state}}</td><td class=bad>{{t.error or ''}}</td></tr>{% endfor %}</table></div>", stats=dict(stats), recent=recent)
     @app.route('/accounts', methods=['GET','POST'])
     @required
@@ -267,7 +273,7 @@ def create_app(config=None):
             except Exception as e: flash('创建失败：'+str(e))
             return redirect(url_for('plans'))
         with store.conn() as c: rows=c.execute("SELECT p.*,count(a.id) accounts,count(pp.id) points FROM plans p LEFT JOIN accounts a ON a.plan_id=p.id LEFT JOIN plan_points pp ON pp.plan_id=p.id GROUP BY p.id ORDER BY p.name").fetchall()
-        body = '''<div class=card><h2>新建计划</h2><form method=post><input type=hidden name=csrf value='{{csrf}}'><input name=name required placeholder='计划名称'><button>创建</button></form></div><div class=card><table><tr><th>名称</th><th>账户</th><th>时间点</th><th>状态</th><th></th></tr>{% for p in rows %}<tr><td>{{p.name}}</td><td>{{p.accounts}}</td><td>{{p.points}}</td><td>{{'启用' if p.enabled else '停用'}}</td><td><a href='{{url_for("plan_detail",pid=p.id)}}'>编辑</a></td></tr>{% endfor %}</table></div>'''
+        body = '''<div class=card><h2>新建计划</h2><form method=post><input type=hidden name=csrf value='{{csrf}}'><input name=name required placeholder='计划名称'><button>创建</button></form></div><div class=card><table><tr><th>名称</th><th>账户</th><th>时间点</th><th>状态</th><th></th></tr>{% for p in rows %}<tr><td>{{p.name}}</td><td>{{p.accounts}}</td><td>{{p.points}}</td><td>{{'启用' if p.enabled else '停用'}}</td><td><a href='{{url_for("plan_detail",pid=p.id)}}'>编辑</a> <form class=inline method=post action='{{url_for("delete_plan",pid=p.id)}}'><button onclick='return confirm("删除计划？已分配账户将变为未分配。")'>删除</button></form></td></tr>{% endfor %}</table></div>'''
         return page(body, rows=rows)
     @app.route('/plans/<int:pid>',methods=['GET','POST'])
     @required
@@ -286,8 +292,8 @@ def create_app(config=None):
             except Exception as e: flash('添加失败：'+str(e))
             return redirect(url_for('plan_detail',pid=pid))
         with store.conn() as c: points=c.execute('SELECT * FROM plan_points WHERE plan_id=? ORDER BY at_minute',(pid,)).fetchall()
-        body = '''<div class=card><h2>{{plan.name}}</h2><form method=post><input type=hidden name=csrf value='{{csrf}}'><input name=at type=time required><input name=low type=number min=1 placeholder='固定值或最小值' required><input name=high type=number min=1 placeholder='最大值（可选）'><button>添加时间点</button></form><p class=muted>同一时间点仅执行一次；随机区间在入队时抽取。</p><table><tr><th>时间</th><th>目标</th><th></th></tr>{% for p in points %}<tr><td>{{clock(p.at_minute)}}</td><td>{{p.low_steps}}{{'' if p.low_steps==p.high_steps else ' – '+p.high_steps|string}}</td><td><form class=inline method=post action='{{url_for("delete_point",pid=pid,point_id=p.id)}}'><button>删除</button></form></td></tr>{% endfor %}</table><form method=post action='{{url_for("delete_plan",pid=pid)}}'><button onclick='return confirm("删除计划？已分配账户将变为未分配。")'>删除计划</button></form></div>'''
-        return page(body, plan=plan, points=points)
+        body = '''<div class=card><h2>{{plan.name}}</h2><form method=post><input type=hidden name=csrf value='{{csrf}}'><input name=at type=time required><input name=low type=number min=1 placeholder='固定值或最小值' required><input name=high type=number min=1 placeholder='最大值（可选）'><button>添加时间点</button></form><p class=muted>同一时间点仅执行一次；随机区间在入队时抽取。</p><table><tr><th>时间</th><th>目标</th><th></th></tr>{% for p in points %}<tr><td>{{clock(p.at_minute)}}</td><td>{{p.low_steps}}{% if p.low_steps != p.high_steps %} – {{p.high_steps}}{% endif %}</td><td><form class=inline method=post action='{{url_for("delete_point",pid=pid,point_id=p.id)}}'><button>删除</button></form></td></tr>{% endfor %}</table><form method=post action='{{url_for("delete_plan",pid=pid)}}'><button onclick='return confirm("删除计划？已分配账户将变为未分配。")'>删除计划</button></form></div>'''
+        return page(body, plan=plan, points=points, pid=pid)
     @app.post('/plans/<int:pid>/points/<int:point_id>/delete')
     @required
     def delete_point(pid,point_id):
@@ -302,7 +308,7 @@ def create_app(config=None):
     @required
     def history():
         with store.conn() as c: rows=c.execute('SELECT * FROM tasks ORDER BY id DESC LIMIT 200').fetchall()
-        body = '''<div class=card><h2>执行记录</h2><table><tr><th>时间</th><th>账户</th><th>来源</th><th>目标</th><th>尝试</th><th>状态</th><th>信息</th><th></th></tr>{% for t in rows %}<tr><td>{{t.created_at}}</td><td>{{t.account_label}}</td><td>{{t.trigger}}</td><td>{{t.target_steps or '-'}}</td><td>{{t.attempts}}</td><td class="{{'ok' if t.state=='success' else 'bad' if t.state=='failed' else ''}}">{{t.state}}</td><td>{{t.error or ''}}</td><td>{% if t.state=='failed' %}<form method=post action='{{url_for("retry_task",tid=t.id)}}'><button>重试</button></form>{% endif %}</td></tr>{% endfor %}</table></div>'''
+        body = '''<div class=card><h2>执行记录</h2><table><tr><th>时间（{{timezone}}）</th><th>账户</th><th>来源</th><th>目标</th><th>尝试</th><th>状态</th><th>信息</th><th></th></tr>{% for t in rows %}<tr><td>{{localtime(t.created_at)}}</td><td>{{t.account_label}}</td><td>{{t.trigger}}</td><td>{{t.target_steps or '-'}}</td><td>{{t.attempts}}</td><td class="{{'ok' if t.state=='success' else 'bad' if t.state=='failed' else ''}}">{{t.state}}</td><td>{{t.error or ''}}</td><td>{% if t.state=='failed' %}<form method=post action='{{url_for("retry_task",tid=t.id)}}'><button>重试</button></form>{% endif %}</td></tr>{% endfor %}</table></div>'''
         return page(body, rows=rows)
     @app.post('/tasks/<int:tid>/retry')
     @required
