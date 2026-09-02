@@ -1,6 +1,7 @@
 import tempfile
 import unittest
-from app import create_app, minute, parse_target
+import warnings
+from app import create_app, minute, parse_target, utcnow
 
 class AppTests(unittest.TestCase):
     def setUp(self):
@@ -18,6 +19,10 @@ class AppTests(unittest.TestCase):
     def test_targets(self):
         self.assertEqual(minute('08:30'), 510); self.assertEqual(parse_target('3','5'),(3,5))
         with self.assertRaises(ValueError): parse_target('5','3')
+    def test_utcnow_is_warning_free(self):
+        with warnings.catch_warnings():
+            warnings.simplefilter('error', DeprecationWarning)
+            self.assertRegex(utcnow(), r'^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}$')
     def test_plan_monotonicity_and_schedule_dedupe(self):
         self.login()
         token = self.app.get('/plans').data.decode().split("name=csrf value='")[1].split("'")[0]

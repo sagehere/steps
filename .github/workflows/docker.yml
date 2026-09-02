@@ -23,6 +23,12 @@ jobs:
           cache: pip
       - run: pip install -r requirements.txt
       - run: python -m unittest -v
+      - name: Verify deployment port
+        run: |
+          cp .env.example .env
+          docker compose config --quiet
+          docker compose config | grep -F 'published: "101"'
+          docker compose config | grep -F 'target: 8000'
       - name: Verify bind-mounted data directory
         run: |
           docker build -t zepp-steps-smoke .

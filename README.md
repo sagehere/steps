@@ -18,7 +18,7 @@ ghcr.io/sagehere/zepp-steps:latest
 
 - 1 核 CPU、512 MB 内存。
 - 已安装 Docker 和 Docker Compose。
-- 一个未被其他程序占用的端口，示例使用 `8000`（也可改为 `101:8000`）。
+- 一个未被其他程序占用的端口，默认使用 `101`。
 
 先登录 VPS，检查 Docker：
 
@@ -105,13 +105,13 @@ docker compose logs --tail=100
 浏览器访问：
 
 ```text
-http://你的VPS公网IP:8000（若 Compose 使用 `101:8000`，则访问 `http://你的VPS公网IP:101`）
+http://你的VPS公网IP:101
 ```
 
 使用 `.env` 中的 `ADMIN_PASSWORD` 登录。如果 VPS 启用了防火墙，需要放行端口：
 
 ```bash
-sudo ufw allow 8000/tcp  # 使用 101:8000 时改为 101/tcp
+sudo ufw allow 101/tcp
 ```
 
 建议正式使用时通过 Nginx、Caddy 或宝塔反向代理配置 HTTPS，然后把 `COOKIE_SECURE` 改成 `true` 并重启容器。
@@ -140,6 +140,27 @@ docker compose logs --tail=100
 ```
 
 新镜像会在启动时仅以 root 修复 `/data` 及其中已有文件的所有者为 UID/GID `10001`，随后立即降权为 `app` 用户运行网站。`/data` 必须是本应用专用的挂载目录；不要将其他重要目录挂载到这里。
+## 端口无法访问
+
+如果容器显示 `Up/healthy`，但访问 `http://VPS地址:101` 被拒绝，先检查本地 Compose 文件是否真的发布了 101 端口。**`docker compose pull` 只更新镜像，不会更新本地 `docker-compose.yml`。** 不要删除 `.env` 或 `data`，只需把端口改为下面的内容并重建容器：
+
+```yaml
+ports:
+  - "101:8000"
+```
+
+```bash
+cd /opt/steps
+nano docker-compose.yml
+docker compose pull
+docker compose up -d --force-recreate
+docker compose ps
+curl http://127.0.0.1:101/healthz
+docker compose logs --tail=100
+```
+
+`docker compose ps` 应显示 `0.0.0.0:101->8000/tcp`，本机健康检查应返回 `{"ok":true}`。如果本机健康检查已成功、但公网仍不能访问，再放行 VPS 防火墙和云厂商安全组的 TCP `101` 端口。
+
 ## 六、更新、备份和卸载
 
 更新到最新镜像：

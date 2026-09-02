@@ -15,7 +15,7 @@ import sqlite3
 import threading
 import time
 import uuid
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from functools import wraps
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -39,7 +39,7 @@ body{font:15px system-ui,sans-serif;margin:auto;max-width:1100px;padding:18px;co
 <nav><strong>Zepp Life 步数计划</strong><a href='{{url_for("dashboard")}}'>仪表盘</a><a href='{{url_for("accounts")}}'>账户</a><a href='{{url_for("plans")}}'>计划</a><a href='{{url_for("history")}}'>执行记录</a><form method=post action='{{url_for("logout")}}'><input type=hidden name=csrf value='{{csrf}}'><button>退出</button></form></nav>
 {% with m=get_flashed_messages() %}{% for x in m %}<div class=flash>{{x}}</div>{% endfor %}{% endwith %}{{body|safe}}</html>"""
 
-def utcnow(): return datetime.utcnow().replace(microsecond=0).isoformat()
+def utcnow(delay=0): return (datetime.now(UTC) + timedelta(seconds=delay)).replace(tzinfo=None, microsecond=0).isoformat()
 def mask(value):
     value = str(value); n = max(1, len(value) // 3)
     return value[:n] + "***" + value[-n:]
@@ -139,7 +139,7 @@ class Runner:
         with self.store.conn() as c:
             if not ok and retryable and attempt < 3:
                 wait = 60 if attempt == 1 else 300
-                c.execute("UPDATE tasks SET state='queued',available_at=?,error=?,started_at=NULL WHERE id=?", ((datetime.utcnow()+timedelta(seconds=wait)).replace(microsecond=0).isoformat(), msg, task['id']))
+                c.execute("UPDATE tasks SET state='queued',available_at=?,error=?,started_at=NULL WHERE id=?", (utcnow(wait), msg, task['id']))
             else: c.execute("UPDATE tasks SET state=?,finished_at=?,error=? WHERE id=?", ('success' if ok else 'failed', utcnow(), None if ok else msg, task['id']))
         time.sleep(self.delay); return True
     def loop(self):
