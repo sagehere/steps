@@ -61,4 +61,47 @@ class AppTests(unittest.TestCase):
         self.assertIn('时间（Asia/Shanghai）', page)
         self.assertIn('2026-09-02 08:00:00', page)
 
+    def test_bulk_plan_assignment_and_unassignment(self):
+        self.login(); app = self.app.application
+        with app.extensions['store'].conn() as c:
+            c.execute("INSERT INTO plans(name,created_at) VALUES('bulk-plan',?)", (utcnow(),)); pid = c.execute('SELECT id FROM plans').fetchone()[0]
+            for name in ('first@example.com', 'second@example.com'):
+                c.execute("INSERT INTO accounts(username,secret,created_at,updated_at) VALUES(?,?,?,?)", (name, app.extensions['store'].seal({'username': name, 'password': 'p'}), utcnow(), utcnow()))
+            ids = [row[0] for row in c.execute('SELECT id FROM accounts ORDER BY id')]
+        page = self.app.get('/accounts').data.decode(); csrf = page.split("name=csrf value='")[1].split("'")[0]
+        self.app.post('/accounts/plan', data={'csrf': csrf, 'account_id': ids[0], 'plan_id': pid})
+        with app.extensions['store'].conn() as c:
+            self.assertEqual(c.execute('SELECT plan_id FROM accounts WHERE id=?', (ids[0],)).fetchone()[0], pid)
+            self.assertIsNone(c.execute('SELECT plan_id FROM accounts WHERE id=?', (ids[1],)).fetchone()[0])
+        self.app.post('/accounts/plan', data={'csrf': csrf, 'account_id': ids[0], 'plan_id': ''})
+        with app.extensions['store'].conn() as c: self.assertIsNone(c.execute('SELECT plan_id FROM accounts WHERE id=?', (ids[0],)).fetchone()[0])
+        self.app.post('/accounts/plan', data={'csrf': csrf, 'account_id': ids[0], 'plan_id': '999999'})
+        self.app.post('/accounts/plan', data={'csrf': csrf, 'plan_id': pid})
+        with app.extensions['store'].conn() as c: self.assertIsNone(c.execute('SELECT plan_id FROM accounts WHERE id=?', (ids[0],)).fetchone()[0])
+
+    def test_history_filters_and_prunes_all_old_task_states(self):
+        self.login(); app = self.app.application
+        with app.extensions['store'].conn() as c:
+            for name in ('first@example.com', 'second@example.com'):
+                c.execute("INSERT INTO accounts(username,secret,created_at,updated_at) VALUES(?,?,?,?)", (name, app.extensions['store'].seal({'username': name, 'password': 'p'}), utcnow(), utcnow()))
+            first, second = [row[0] for row in c.execute('SELECT id FROM accounts ORDER BY id')]
+            for state in ('queued', 'running', 'success', 'failed'):
+                c.execute("INSERT INTO tasks(account_id,account_label,trigger,state,available_at,created_at) VALUES(?,?,?,?,?,?)", (first, 'old-' + state, 'test', state, utcnow(), utcnow(-8 * 24 * 60 * 60)))
+            c.execute("INSERT INTO tasks(account_id,account_label,trigger,state,available_at,created_at) VALUES(?,?,?,?,?,?)", (first, 'first-recent', 'test', 'success', utcnow(), utcnow()))
+            c.execute("INSERT INTO tasks(account_id,account_label,trigger,state,available_at,created_at) VALUES(?,?,?,?,?,?)", (second, 'second-recent', 'test', 'failed', utcnow(), utcnow()))
+        self.assertEqual(app.extensions['store'].prune_tasks(), 4)
+        page = self.app.get(f'/history?account_id={first}').data.decode()
+        self.assertIn('first-recent', page); self.assertNotIn('second-recent', page); self.assertNotIn('old-queued', page)
+        page = self.app.get('/history').data.decode()
+        self.assertIn('first-recent', page); self.assertIn('second-recent', page)
+
+    def test_responsive_account_and_history_markup(self):
+        self.login()
+        accounts = self.app.get('/accounts').data.decode(); history = self.app.get('/history').data.decode()
+        self.assertIn('@media(max-width:700px)', accounts)
+        self.assertIn('id=select-all', accounts)
+        self.assertIn('class=responsive', accounts)
+        self.assertIn('name=account_id', history)
+        self.assertIn('7 天', history)
+
 if __name__ == '__main__': unittest.main()
