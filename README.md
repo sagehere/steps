@@ -1,11 +1,11 @@
-# Zepp Life 多账户步数计划
+﻿# Zepp Life 多账户步数计划
 
 一个适合部署在 VPS 上的私有管理网站。支持多个 Zepp Life 账户、批量执行、固定或随机步数、每日多时间点计划、失败重试和执行记录。
 
 Docker 镜像只发布到 GitHub Container Registry：
 
 ```text
-ghcr.io/sagehere/steps:latest
+ghcr.io/sagehere/zepp-steps:latest
 ```
 
 镜像同时支持常见的 `linux/amd64`（Intel/AMD VPS）和 `linux/arm64`（ARM VPS、甲骨文 ARM 等）平台，Docker 会自动选择正确版本。

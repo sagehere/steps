@@ -1,4 +1,4 @@
-name: Build multi-arch image
+﻿name: Build multi-arch image
 
 on:
   push:
@@ -40,7 +40,7 @@ jobs:
       - id: meta
         uses: docker/metadata-action@v6
         with:
-          images: ghcr.io/sagehere/steps
+          images: ghcr.io/sagehere/zepp-steps
           tags: |
             type=raw,value=latest,enable={{is_default_branch}}
             type=sha,prefix=sha-

@@ -1,6 +1,6 @@
-services:
+﻿services:
   steps:
-    image: ghcr.io/sagehere/steps:latest
+    image: ghcr.io/sagehere/zepp-steps:latest
     pull_policy: always
     restart: unless-stopped
     env_file: .env
