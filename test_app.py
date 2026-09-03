@@ -2,6 +2,8 @@ import tempfile
 import unittest
 import warnings
 import inspect
+import json
+import sqlite3
 from datetime import datetime
 from unittest.mock import MagicMock, patch
 from app import create_app, localtime, minute, parse_proxy_url, parse_random_range, parse_steps, utcnow
@@ -166,5 +168,75 @@ class AppTests(unittest.TestCase):
         with store.conn() as c:
             skipped = c.execute("SELECT state,error FROM tasks WHERE target_steps=50").fetchone()
         self.assertEqual(skipped[0], 'skipped'); self.assertIn('低于当天已成功步数', skipped[1])
+
+    def test_plan_time_random_settings_and_cross_day_validation(self):
+        self.login(); app = self.app.application; store = app.extensions['store']
+        with store.conn() as c:
+            c.execute("INSERT INTO plans(name,created_at) VALUES('time-random',?)", (utcnow(),)); pid = c.execute('SELECT id FROM plans').fetchone()[0]
+            c.execute('INSERT INTO plan_points(plan_id,at_minute,low_steps,high_steps) VALUES(?,?,?,?)', (pid, 10, 3000, 3000))
+            plan = c.execute('SELECT time_random_enabled,time_random_min,time_random_max FROM plans WHERE id=?', (pid,)).fetchone()
+        self.assertEqual(tuple(plan), (0, -10, 10))
+        csrf = self.app.get(f'/plans/{pid}').data.decode().split("name=csrf value='")[1].split("'")[0]
+        self.app.post(f'/plans/{pid}/time-random', data={'csrf': csrf, 'enabled': '1', 'low': '-10', 'high': '10'})
+        with store.conn() as c: self.assertEqual(tuple(c.execute('SELECT time_random_enabled,time_random_min,time_random_max FROM plans WHERE id=?', (pid,)).fetchone()), (1, -10, 10))
+        self.app.post(f'/plans/{pid}', data={'csrf': csrf, 'at': '00:00', 'steps': '4000'})
+        with store.conn() as c: self.assertEqual(c.execute('SELECT count(*) FROM plan_points WHERE plan_id=?', (pid,)).fetchone()[0], 1)
+
+    def test_legacy_plan_table_migrates_time_random_columns(self):
+        legacy = tempfile.NamedTemporaryFile(suffix='.db', delete=False); legacy.close()
+        with sqlite3.connect(legacy.name) as c:
+            c.execute('CREATE TABLE plans (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, enabled INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL)')
+            c.execute("INSERT INTO plans(name,created_at) VALUES('legacy','now')")
+        legacy_app = create_app({'DB': legacy.name, 'APP_SECRET': 'x'*40, 'ADMIN_PASSWORD': 'pass', 'COOKIE_SECURE': False, 'START_WORKER': False})
+        with legacy_app.extensions['store'].conn() as c:
+            columns = {row['name'] for row in c.execute('PRAGMA table_info(plans)')}
+            self.assertTrue({'time_random_enabled', 'time_random_min', 'time_random_max'} <= columns)
+            self.assertEqual(tuple(c.execute('SELECT time_random_enabled,time_random_min,time_random_max FROM plans').fetchone()), (0, -10, 10))
+
+    def test_daily_time_offsets_are_per_account_and_stable(self):
+        app = self.app.application; store = app.extensions['store']; runner = app.extensions['runner']
+        with store.conn() as c:
+            c.execute("INSERT INTO plans(name,time_random_enabled,time_random_min,time_random_max,created_at) VALUES('daily',1,-10,10,?)", (utcnow(),)); pid = c.execute('SELECT id FROM plans').fetchone()[0]
+            for at, steps in ((600, 3000), (620, 4000)): c.execute('INSERT INTO plan_points(plan_id,at_minute,low_steps,high_steps) VALUES(?,?,?,?)', (pid, at, steps, steps))
+            for name in ('one@example.com', 'two@example.com'): c.execute("INSERT INTO accounts(username,secret,plan_id,created_at,updated_at) VALUES(?,?,?,?,?)", (name, store.seal({'username': name, 'password': 'p'}), pid, utcnow(), utcnow()))
+            point_ids = [row[0] for row in c.execute('SELECT id FROM plan_points ORDER BY at_minute')]
+        now = datetime(2026, 9, 2, 9, 55, tzinfo=runner.tz)
+        with patch.object(runner, 'now', return_value=now), patch('app.random.randint', side_effect=[-10, 5, 0, 10]): runner.enqueue_scheduled()
+        with store.conn() as c:
+            snapshots = c.execute('SELECT offsets_json FROM daily_plan_offsets ORDER BY account_id').fetchall()
+            self.assertEqual(json.loads(snapshots[0][0]), {str(point_ids[0]): -10, str(point_ids[1]): 5})
+            self.assertEqual(json.loads(snapshots[1][0]), {str(point_ids[0]): 0, str(point_ids[1]): 10})
+            self.assertEqual(c.execute("SELECT count(*) FROM tasks WHERE trigger='计划'").fetchone()[0], 1)
+        with patch.object(runner, 'now', return_value=now), patch('app.random.randint', side_effect=AssertionError('must not redraw')): runner.enqueue_scheduled()
+        tomorrow = datetime(2026, 9, 3, 9, 0, tzinfo=runner.tz)
+        with patch.object(runner, 'now', return_value=tomorrow), patch('app.random.randint', side_effect=[1, 2, 3, 4]): runner.enqueue_scheduled()
+        with store.conn() as c: self.assertEqual(c.execute('SELECT count(*) FROM daily_plan_offsets').fetchone()[0], 2)
+
+    def test_today_plan_view_creates_snapshot_used_by_scheduler(self):
+        self.login(); app = self.app.application; store = app.extensions['store']; runner = app.extensions['runner']
+        with store.conn() as c:
+            c.execute("INSERT INTO plans(name,time_random_enabled,time_random_min,time_random_max,created_at) VALUES('view',1,-10,10,?)", (utcnow(),)); pid = c.execute('SELECT id FROM plans').fetchone()[0]
+            c.execute('INSERT INTO plan_points(plan_id,at_minute,low_steps,high_steps) VALUES(?,?,?,?)', (pid, 600, 3000, 3000))
+            c.execute("INSERT INTO accounts(username,secret,plan_id,created_at,updated_at) VALUES(?,?,?,?,?)", ('view@example.com', store.seal({'username': 'view@example.com', 'password': 'p'}), pid, utcnow(), utcnow())); aid = c.execute('SELECT id FROM accounts').fetchone()[0]
+        now = datetime(2026, 9, 2, 9, 55, tzinfo=runner.tz)
+        with patch.object(runner, 'now', return_value=now), patch('app.random.randint', return_value=-5): page = self.app.get(f'/accounts/{aid}/today').data.decode()
+        self.assertIn('09:55', page); self.assertIn('-5', page); self.assertIn('待调度', page)
+        with patch.object(runner, 'now', return_value=now), patch('app.random.randint', side_effect=AssertionError('must reuse view snapshot')): runner.enqueue_scheduled()
+        with store.conn() as c: self.assertEqual(c.execute("SELECT count(*) FROM tasks WHERE account_id=? AND trigger='计划'", (aid,)).fetchone()[0], 1)
+
+    def test_time_offset_order_reversal_uses_final_time_and_skips_lower_target(self):
+        app = self.app.application; store = app.extensions['store']; runner = app.extensions['runner']
+        with store.conn() as c:
+            c.execute("INSERT INTO plans(name,time_random_enabled,time_random_min,time_random_max,created_at) VALUES('reverse',1,-10,10,?)", (utcnow(),)); pid = c.execute('SELECT id FROM plans').fetchone()[0]
+            for at, steps in ((600, 100), (605, 200)): c.execute('INSERT INTO plan_points(plan_id,at_minute,low_steps,high_steps) VALUES(?,?,?,?)', (pid, at, steps, steps))
+            c.execute("INSERT INTO accounts(username,secret,plan_id,created_at,updated_at) VALUES(?,?,?,?,?)", ('reverse@example.com', store.seal({'username': 'reverse@example.com', 'password': 'p'}), pid, utcnow(), utcnow())); aid = c.execute('SELECT id FROM accounts').fetchone()[0]
+        first = datetime(2026, 9, 2, 10, 0, tzinfo=runner.tz)
+        with patch.object(runner, 'now', return_value=first), patch('app.random.randint', side_effect=[10, -10]): runner.enqueue_scheduled()
+        with store.conn() as c:
+            task = c.execute("SELECT id,target_steps FROM tasks WHERE account_id=?", (aid,)).fetchone()
+            self.assertEqual(task['target_steps'], 200); c.execute("UPDATE tasks SET state='success' WHERE id=?", (task['id'],))
+        later = datetime(2026, 9, 2, 10, 10, tzinfo=runner.tz)
+        with patch.object(runner, 'now', return_value=later): runner.enqueue_scheduled()
+        with store.conn() as c: self.assertEqual(c.execute('SELECT state FROM tasks WHERE account_id=? AND target_steps=100', (aid,)).fetchone()[0], 'skipped')
 
 if __name__ == '__main__': unittest.main()

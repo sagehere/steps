@@ -29,11 +29,12 @@ from vendor.util import zepp_helper
 
 SCHEMA = """
 PRAGMA foreign_keys=ON;
-CREATE TABLE IF NOT EXISTS plans (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, enabled INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS plans (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, enabled INTEGER NOT NULL DEFAULT 1, time_random_enabled INTEGER NOT NULL DEFAULT 0, time_random_min INTEGER NOT NULL DEFAULT -10, time_random_max INTEGER NOT NULL DEFAULT 10, created_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS plan_points (id INTEGER PRIMARY KEY, plan_id INTEGER NOT NULL REFERENCES plans(id) ON DELETE CASCADE, at_minute INTEGER NOT NULL, low_steps INTEGER NOT NULL, high_steps INTEGER NOT NULL, UNIQUE(plan_id, at_minute));
 CREATE TABLE IF NOT EXISTS accounts (id INTEGER PRIMARY KEY, username TEXT NOT NULL UNIQUE, note TEXT NOT NULL DEFAULT '', secret TEXT NOT NULL, token_secret TEXT, plan_id INTEGER REFERENCES plans(id) ON DELETE SET NULL, enabled INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS tasks (id INTEGER PRIMARY KEY, account_id INTEGER REFERENCES accounts(id) ON DELETE SET NULL, account_label TEXT NOT NULL, point_id INTEGER REFERENCES plan_points(id) ON DELETE SET NULL, run_date TEXT, trigger TEXT NOT NULL, target_steps INTEGER, state TEXT NOT NULL DEFAULT 'queued', attempts INTEGER NOT NULL DEFAULT 0, available_at TEXT NOT NULL, started_at TEXT, finished_at TEXT, error TEXT, created_at TEXT NOT NULL, UNIQUE(account_id, point_id, run_date));
 CREATE TABLE IF NOT EXISTS settings (id INTEGER PRIMARY KEY CHECK(id=1), proxy_secret TEXT, random_enabled INTEGER NOT NULL DEFAULT 0, random_min INTEGER NOT NULL DEFAULT -100, random_max INTEGER NOT NULL DEFAULT 100);
+CREATE TABLE IF NOT EXISTS daily_plan_offsets (account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE, plan_id INTEGER NOT NULL REFERENCES plans(id) ON DELETE CASCADE, run_date TEXT NOT NULL, offsets_json TEXT NOT NULL, created_at TEXT NOT NULL, PRIMARY KEY(account_id, plan_id, run_date));
 CREATE INDEX IF NOT EXISTS task_queue ON tasks(state, available_at, id);
 CREATE INDEX IF NOT EXISTS task_created_at ON tasks(created_at);
 """
@@ -63,6 +64,10 @@ def parse_steps(value):
 def parse_random_range(low, high):
     low, high = int(low), int(high)
     if low > high: raise ValueError("随机下限不能大于上限")
+    return low, high
+def parse_time_random_range(low, high):
+    low, high = parse_random_range(low, high)
+    if low < -1439 or high > 1439: raise ValueError("时间随机范围必须在 -1439 至 1439 分钟内")
     return low, high
 def parse_proxy_url(value):
     value = value.strip(); parts = urlsplit(value)
@@ -94,6 +99,9 @@ class Store:
         Path(self.path).parent.mkdir(parents=True, exist_ok=True)
         with self.conn() as c:
             c.executescript(SCHEMA)
+            columns = {row['name'] for row in c.execute("PRAGMA table_info(plans)")}
+            for name, default in (('time_random_enabled', '0'), ('time_random_min', '-10'), ('time_random_max', '10')):
+                if name not in columns: c.execute(f"ALTER TABLE plans ADD COLUMN {name} INTEGER NOT NULL DEFAULT {default}")
             c.execute("INSERT OR IGNORE INTO settings(id) VALUES(1)")
             c.execute("UPDATE plan_points SET high_steps=low_steps WHERE high_steps<>low_steps")
             c.execute("UPDATE tasks SET state='queued', started_at=NULL WHERE state='running'")
@@ -126,12 +134,22 @@ class Runner:
         client = requests.Session(); client.trust_env = False
         if proxy: client.proxies.update({'http': proxy, 'https': proxy})
         return client
+    def now(self): return datetime.now(self.tz)
     def target(self, base, settings):
         if settings['random_enabled']: return base + random.randint(settings['random_min'], settings['random_max'])
         return base
     def valid_base(self, base, settings):
         if base < 1: raise ValueError("固定步数必须为正整数")
         if settings['random_enabled'] and base + settings['random_min'] < 1: raise ValueError("固定步数加随机下限必须至少为 1")
+    def valid_time_random(self, minutes, enabled, low, high):
+        if enabled and any(at + low < 0 or at + high > 1439 for at in minutes): raise ValueError("随机时间范围会使已有时间点跨天")
+    def daily_offsets(self, c, account_id, plan, points, date):
+        row = c.execute("SELECT offsets_json FROM daily_plan_offsets WHERE account_id=? AND plan_id=? AND run_date=?", (account_id, plan['id'], date)).fetchone()
+        if not row:
+            offsets = {str(point['point_id']): random.randint(plan['time_random_min'], plan['time_random_max']) if plan['time_random_enabled'] else 0 for point in points}
+            c.execute("INSERT OR IGNORE INTO daily_plan_offsets(account_id,plan_id,run_date,offsets_json,created_at) VALUES(?,?,?,?,?)", (account_id, plan['id'], date, json.dumps(offsets, separators=(',', ':')), utcnow()))
+            row = c.execute("SELECT offsets_json FROM daily_plan_offsets WHERE account_id=? AND plan_id=? AND run_date=?", (account_id, plan['id'], date)).fetchone()
+        return {int(point_id): int(offset) for point_id, offset in json.loads(row['offsets_json']).items()}
     def add_task(self, c, account, base, settings, trigger, point_id=None, run_date=None):
         self.valid_base(base, settings); target = self.target(base, settings)
         previous = c.execute("SELECT MAX(target_steps) FROM tasks WHERE account_id=? AND run_date=? AND state='success'", (account['id'], run_date)).fetchone()[0] if run_date else None
@@ -141,14 +159,20 @@ class Runner:
         changed = c.execute(sql, values).rowcount
         return ('skipped' if skipped else 'queued') if changed else None
     def enqueue_scheduled(self):
-        now = datetime.now(self.tz); date, now_min = now.date().isoformat(), now.hour * 60 + now.minute
+        now = self.now(); date, now_min = now.date().isoformat(), now.hour * 60 + now.minute
         settings = self.store.settings()
         with self.store.conn() as c:
-            rows = c.execute("""SELECT a.*, p.id point_id,p.at_minute,p.low_steps,p.high_steps FROM accounts a JOIN plans pl ON pl.id=a.plan_id AND pl.enabled=1 JOIN plan_points p ON p.plan_id=pl.id WHERE a.enabled=1 AND p.at_minute<=? ORDER BY a.id,p.at_minute""", (now_min,)).fetchall()
-            latest = {}
-            for r in rows: latest[r['id']] = r
-            for r in latest.values():
-                self.add_task(c, r, r['low_steps'], settings, '计划', r['point_id'], date)
+            c.execute("DELETE FROM daily_plan_offsets WHERE run_date<?", (date,))
+            rows = c.execute("""SELECT a.*, pl.id schedule_plan_id,pl.time_random_enabled,pl.time_random_min,pl.time_random_max,p.id point_id,p.at_minute,p.low_steps,p.high_steps FROM accounts a JOIN plans pl ON pl.id=a.plan_id AND pl.enabled=1 JOIN plan_points p ON p.plan_id=pl.id WHERE a.enabled=1 ORDER BY a.id,p.at_minute,p.id""").fetchall()
+            grouped = {}
+            for row in rows: grouped.setdefault(row['id'], []).append(row)
+            for account_id, points in grouped.items():
+                plan = {'id': points[0]['schedule_plan_id'], 'time_random_enabled': points[0]['time_random_enabled'], 'time_random_min': points[0]['time_random_min'], 'time_random_max': points[0]['time_random_max']}
+                offsets = self.daily_offsets(c, account_id, plan, points, date)
+                due = [point for point in points if point['point_id'] in offsets and point['at_minute'] + offsets[point['point_id']] <= now_min]
+                if due:
+                    point = max(due, key=lambda value: (value['at_minute'] + offsets[value['point_id']], value['at_minute'], value['point_id']))
+                    self.add_task(c, point, point['low_steps'], settings, '计划', point['point_id'], date)
     def enqueue(self, ids, steps, trigger='手动'):
         steps = parse_steps(steps); now = datetime.now(self.tz); date = now.date().isoformat(); queued = skipped = 0; settings = self.store.settings()
         with self.store.conn() as c:
@@ -314,8 +338,33 @@ def create_app(config=None):
             except Exception as e: flash('添加失败：'+str(e))
             return redirect(url_for('accounts'))
         with store.conn() as c: rows=c.execute("SELECT a.*,p.name plan_name FROM accounts a LEFT JOIN plans p ON p.id=a.plan_id ORDER BY a.id DESC").fetchall(); plans=c.execute('SELECT * FROM plans ORDER BY name').fetchall()
-        body = '''<div class=card><h2>添加账户</h2><form method=post class=grid><input type=hidden name=csrf value='{{csrf}}'><input name=username placeholder='Zepp Life 手机号或邮箱' required><input name=password type=password placeholder=密码 required><input name=note placeholder=备注><select name=plan_id><option value=''>不分配计划</option>{% for p in plans %}<option value={{p.id}}>{{p.name}}</option>{% endfor %}</select><button>添加</button></form></div><div class=card><h2>批量导入</h2><form method=post action='{{url_for("import_accounts")}}'><select name=plan_id><option value=''>不分配计划</option>{% for p in plans %}<option value={{p.id}}>{{p.name}}</option>{% endfor %}</select><textarea name=rows placeholder='每行：账号,密码,备注'></textarea><button>导入</button></form></div><div class=card><h2>账户</h2><form method=post action='{{url_for("manual_run")}}'><div class=toolbar><label><input id=select-all type=checkbox> 全选</label><select name=plan_id><option value=''>取消计划分配</option>{% for p in plans %}<option value={{p.id}}>{{p.name}}</option>{% endfor %}</select><button class=secondary formnovalidate formaction='{{url_for("bulk_assign_plan")}}'>批量配置计划</button></div><div class=table-wrap><table class=responsive><thead><tr><th></th><th>账号</th><th>备注/计划</th><th>状态</th><th>操作</th></tr></thead><tbody>{% for a in rows %}<tr><td data-label=选择><input class=account-select type=checkbox name=account_id value={{a.id}}></td><td data-label=账号>{{mask(a.username)}}</td><td data-label=备注/计划>{{a.note}}<br><span class=muted>{{a.plan_name or '未分配'}}</span></td><td data-label=状态><span class=badge>{{'启用' if a.enabled else '停用'}}</span></td><td data-label=操作 class=actions><a class=link href='{{url_for("edit_account",aid=a.id)}}'>编辑</a> <button formnovalidate formaction='{{url_for("test_account",aid=a.id)}}'>测试</button><button class=secondary formnovalidate formaction='{{url_for("toggle_account",aid=a.id)}}'>{{'停用' if a.enabled else '启用'}}</button><button class=danger formnovalidate formaction='{{url_for("delete_account",aid=a.id)}}' onclick='return confirm("删除账户及其凭据？")'>删除</button></td></tr>{% else %}<tr><td colspan=5 class=empty>还没有账户，先添加或批量导入。</td></tr>{% endfor %}</tbody></table></div><div class=toolbar><span class=muted>手动执行仅处理启用账户。</span><span class=spacer></span><input name=steps type=number min=1 required placeholder=固定步数><button>执行选中账户</button></div></form></div><script>document.getElementById('select-all')?.addEventListener('change',function(){document.querySelectorAll('.account-select').forEach(function(box){box.checked=this.checked},this)})</script>'''
+        body = '''<div class=card><h2>添加账户</h2><form method=post class=grid><input type=hidden name=csrf value='{{csrf}}'><input name=username placeholder='Zepp Life 手机号或邮箱' required><input name=password type=password placeholder=密码 required><input name=note placeholder=备注><select name=plan_id><option value=''>不分配计划</option>{% for p in plans %}<option value={{p.id}}>{{p.name}}</option>{% endfor %}</select><button>添加</button></form></div><div class=card><h2>批量导入</h2><form method=post action='{{url_for("import_accounts")}}'><select name=plan_id><option value=''>不分配计划</option>{% for p in plans %}<option value={{p.id}}>{{p.name}}</option>{% endfor %}</select><textarea name=rows placeholder='每行：账号,密码,备注'></textarea><button>导入</button></form></div><div class=card><h2>账户</h2><form method=post action='{{url_for("manual_run")}}'><div class=toolbar><label><input id=select-all type=checkbox> 全选</label><select name=plan_id><option value=''>取消计划分配</option>{% for p in plans %}<option value={{p.id}}>{{p.name}}</option>{% endfor %}</select><button class=secondary formnovalidate formaction='{{url_for("bulk_assign_plan")}}'>批量配置计划</button></div><div class=table-wrap><table class=responsive><thead><tr><th></th><th>账号</th><th>备注/计划</th><th>状态</th><th>操作</th></tr></thead><tbody>{% for a in rows %}<tr><td data-label=选择><input class=account-select type=checkbox name=account_id value={{a.id}}></td><td data-label=账号>{{mask(a.username)}}</td><td data-label=备注/计划>{{a.note}}<br><span class=muted>{{a.plan_name or '未分配'}}</span></td><td data-label=状态><span class=badge>{{'启用' if a.enabled else '停用'}}</span></td><td data-label=操作 class=actions><a class=link href='{{url_for("account_today",aid=a.id)}}'>今日计划</a> <a class=link href='{{url_for("edit_account",aid=a.id)}}'>编辑</a> <button formnovalidate formaction='{{url_for("test_account",aid=a.id)}}'>测试</button><button class=secondary formnovalidate formaction='{{url_for("toggle_account",aid=a.id)}}'>{{'停用' if a.enabled else '启用'}}</button><button class=danger formnovalidate formaction='{{url_for("delete_account",aid=a.id)}}' onclick='return confirm("删除账户及其凭据？")'>删除</button></td></tr>{% else %}<tr><td colspan=5 class=empty>还没有账户，先添加或批量导入。</td></tr>{% endfor %}</tbody></table></div><div class=toolbar><span class=muted>手动执行仅处理启用账户。</span><span class=spacer></span><input name=steps type=number min=1 required placeholder=固定步数><button>执行选中账户</button></div></form></div><script>document.getElementById('select-all')?.addEventListener('change',function(){document.querySelectorAll('.account-select').forEach(function(box){box.checked=this.checked},this)})</script>'''
         return page(body, rows=rows, plans=plans)
+    @app.get('/accounts/<int:aid>/today')
+    @required
+    def account_today(aid):
+        now = runner.now(); date, now_min = now.date().isoformat(), now.hour * 60 + now.minute
+        with store.conn() as c:
+            account = c.execute('SELECT * FROM accounts WHERE id=?', (aid,)).fetchone()
+            if not account: abort(404)
+            plan = c.execute('SELECT * FROM plans WHERE id=?', (account['plan_id'],)).fetchone() if account['plan_id'] else None
+            points = c.execute('SELECT id point_id,at_minute,low_steps FROM plan_points WHERE plan_id=? ORDER BY at_minute,id', (plan['id'],)).fetchall() if plan else []
+            offsets = runner.daily_offsets(c, aid, plan, points, date) if plan else {}
+            tasks = {task['point_id']: task for task in c.execute('SELECT * FROM tasks WHERE account_id=? AND run_date=? AND point_id IS NOT NULL', (aid, date))}
+        active_points = [point for point in points if point['point_id'] in offsets]
+        due = [point for point in active_points if point['at_minute'] + offsets[point['point_id']] <= now_min]
+        latest = max(due, key=lambda point: (point['at_minute'] + offsets[point['point_id']], point['at_minute'], point['point_id'])) if due else None
+        rows = []
+        for point in active_points:
+            offset, task = offsets[point['point_id']], tasks.get(point['point_id'])
+            if task: status = {'queued': '排队中', 'running': '执行中', 'success': '成功', 'failed': '失败', 'skipped': '已跳过'}.get(task['state'], task['state'])
+            elif not account['enabled'] or not plan['enabled']: status = '不会自动执行'
+            elif point['at_minute'] + offset > now_min: status = '待执行'
+            elif latest and point['point_id'] == latest['point_id']: status = '待调度'
+            else: status = '已错过'
+            rows.append({'at_minute': point['at_minute'], 'offset': f'{offset:+d}', 'final_minute': point['at_minute'] + offset, 'steps': point['low_steps'], 'status': status})
+        body = '''<div class=card><h2>{{mask(account.username)}} 的今日计划</h2>{% if not plan %}<p class=empty>该账户未分配计划。</p>{% elif not points %}<p class=empty>计划“{{plan.name}}”还没有时间点。</p>{% else %}<p class=muted>计划：{{plan.name}} · 账户{{'启用' if account.enabled else '停用'}} · 计划{{'启用' if plan.enabled else '停用'}}。今日偏移已固定。</p><div class=table-wrap><table class=responsive><thead><tr><th>原时间</th><th>偏移（分钟）</th><th>最终时间</th><th>固定步数</th><th>状态</th></tr></thead><tbody>{% for row in rows %}<tr><td data-label=原时间>{{clock(row.at_minute)}}</td><td data-label=偏移>{{row.offset}}</td><td data-label=最终时间>{{clock(row.final_minute)}}</td><td data-label=固定步数>{{row.steps}}</td><td data-label=状态>{{row.status}}</td></tr>{% else %}<tr><td colspan=5 class=empty>今日快照创建后新增的时间点将从明日起生效。</td></tr>{% endfor %}</tbody></table></div>{% endif %}<p><a class=link href='{{url_for("accounts")}}'>返回账户</a></p></div>'''
+        return page(body, account=account, plan=plan, points=points, rows=rows)
     @app.route('/accounts/<int:aid>/edit', methods=['GET', 'POST'])
     @required
     def edit_account(aid):
@@ -403,6 +452,7 @@ def create_app(config=None):
             try:
                 at=minute(request.form['at']); steps=parse_steps(request.form['steps']); settings=store.settings()
                 runner.valid_base(steps, settings)
+                runner.valid_time_random([at], plan['time_random_enabled'], plan['time_random_min'], plan['time_random_max'])
                 with store.conn() as c:
                     points=c.execute('SELECT * FROM plan_points WHERE plan_id=? ORDER BY at_minute',(pid,)).fetchall()
                     candidate=[(p['at_minute'],p['low_steps']) for p in points]+[(at,steps)]; candidate.sort()
@@ -412,8 +462,23 @@ def create_app(config=None):
             except Exception as e: flash('添加失败：'+str(e))
             return redirect(url_for('plan_detail',pid=pid))
         with store.conn() as c: points=c.execute('SELECT * FROM plan_points WHERE plan_id=? ORDER BY at_minute',(pid,)).fetchall()
-        body = '''<div class=card><h2>{{plan.name}}</h2><form method=post class=toolbar><input type=hidden name=csrf value='{{csrf}}'><input name=at type=time required><input name=steps type=number min=1 placeholder='固定步数' required><button>添加时间点</button></form><p class=muted>同一时间点仅执行一次；随机偏移由“设置”页统一控制。</p><div class=table-wrap><table class=responsive><thead><tr><th>时间</th><th>固定步数</th><th></th></tr></thead><tbody>{% for p in points %}<tr><td data-label=时间>{{clock(p.at_minute)}}</td><td data-label=固定步数>{{p.low_steps}}</td><td data-label=操作><form class=inline method=post action='{{url_for("delete_point",pid=pid,point_id=p.id)}}'><button class=danger>删除</button></form></td></tr>{% else %}<tr><td colspan=3 class=empty>还没有时间点。</td></tr>{% endfor %}</tbody></table></div><form method=post action='{{url_for("delete_plan",pid=pid)}}'><button class=danger onclick='return confirm("删除计划？已分配账户将变为未分配。")'>删除计划</button></form></div>'''
+        body = '''<div class=card><h2>{{plan.name}}</h2><form method=post class=toolbar><input type=hidden name=csrf value='{{csrf}}'><input name=at type=time required><input name=steps type=number min=1 placeholder='固定步数' required><button>添加时间点</button></form><p class=muted>同一时间点仅执行一次。</p><div class=table-wrap><table class=responsive><thead><tr><th>时间</th><th>固定步数</th><th></th></tr></thead><tbody>{% for p in points %}<tr><td data-label=时间>{{clock(p.at_minute)}}</td><td data-label=固定步数>{{p.low_steps}}</td><td data-label=操作><form class=inline method=post action='{{url_for("delete_point",pid=pid,point_id=p.id)}}'><button class=danger>删除</button></form></td></tr>{% else %}<tr><td colspan=3 class=empty>还没有时间点。</td></tr>{% endfor %}</tbody></table></div><form method=post action='{{url_for("save_plan_time_random",pid=pid)}}' class=toolbar><label><input type=checkbox name=enabled value=1 {% if plan.time_random_enabled %}checked{% endif %}> 启用随机时间</label><input type=number name=low value='{{plan.time_random_min}}' required placeholder='下限（分钟）'><input type=number name=high value='{{plan.time_random_max}}' required placeholder='上限（分钟）'><button>保存随机时间</button></form><p class=muted>开启后，每个账户每天首次调度或查看今日计划时，按时间点顺序独立抽取偏移；当天结果固定。偏移不能跨天。</p><form method=post action='{{url_for("delete_plan",pid=pid)}}'><button class=danger onclick='return confirm("删除计划？已分配账户将变为未分配。")'>删除计划</button></form></div>'''
         return page(body, plan=plan, points=points, pid=pid)
+    @app.post('/plans/<int:pid>/time-random')
+    @required
+    def save_plan_time_random(pid):
+        try:
+            enabled = bool(request.form.get('enabled'))
+            low, high = parse_time_random_range(request.form['low'], request.form['high'])
+            with store.conn() as c:
+                plan = c.execute('SELECT * FROM plans WHERE id=?', (pid,)).fetchone()
+                if not plan: abort(404)
+                points = c.execute('SELECT at_minute FROM plan_points WHERE plan_id=?', (pid,)).fetchall()
+                runner.valid_time_random([point['at_minute'] for point in points], enabled, low, high)
+                c.execute('UPDATE plans SET time_random_enabled=?,time_random_min=?,time_random_max=? WHERE id=?', (int(enabled), low, high, pid))
+            flash('随机时间设置已保存，将从该账户当天首次调度或查看时生效')
+        except Exception as e: flash('随机时间设置保存失败：' + str(e))
+        return redirect(url_for('plan_detail', pid=pid))
     @app.post('/plans/<int:pid>/points/<int:point_id>/delete')
     @required
     def delete_point(pid,point_id):
