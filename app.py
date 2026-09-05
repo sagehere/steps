@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import base64
 import csv
+from contextlib import contextmanager
 import hashlib
 import hmac
 import ipaddress
@@ -23,7 +24,7 @@ from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
 
 from Crypto.Cipher import AES
-from flask import Flask, abort, flash, g, redirect, render_template, render_template_string, request, session, url_for
+from flask import Flask, abort, flash, g, redirect, render_template, render_template_string, request, send_file, session, url_for
 import requests
 from vendor.util import zepp_helper
 
@@ -43,6 +44,11 @@ CREATE TABLE IF NOT EXISTS admin_credentials (token_hash TEXT PRIMARY KEY, expir
 REMEMBER_COOKIE = 'admin_remember'
 REMEMBER_SECONDS = 30 * 24 * 60 * 60
 STATE_LABELS = {'queued': '排队中', 'running': '执行中', 'success': '成功', 'failed': '失败', 'skipped': '已跳过'}
+BACKUP_MAGIC = b'STEPSBAK1'
+BACKUP_VERSION = 1
+BACKUP_LIMIT = 16 * 1024 * 1024
+
+class RestoreBusy(Exception): pass
 
 def today_points(runner, c, account, plan, points, now):
     """One source of truth for the account page and dashboard; never redraw today's offsets."""
@@ -109,11 +115,83 @@ def safe_error(exc, proxy=''):
             if value: message = message.replace(value, '***')
     return message[:300]
 
+def backup_key(password, salt):
+    if not isinstance(password, str) or len(password) < 12: raise ValueError('备份密码至少需要 12 个字符')
+    return hashlib.scrypt(password.encode(), salt=salt, n=32768, r=8, p=1, dklen=32, maxmem=64 * 1024 * 1024)
+
+def encrypt_backup(payload, password):
+    salt, nonce = secrets.token_bytes(16), secrets.token_bytes(16)
+    cipher = AES.new(backup_key(password, salt), AES.MODE_GCM, nonce=nonce)
+    data, tag = cipher.encrypt_and_digest(json.dumps(payload, ensure_ascii=False, separators=(',', ':')).encode())
+    return BACKUP_MAGIC + bytes([BACKUP_VERSION]) + salt + nonce + tag + data
+
+def decrypt_backup(raw, password):
+    if not isinstance(raw, bytes) or len(raw) < len(BACKUP_MAGIC) + 49 or not raw.startswith(BACKUP_MAGIC): raise ValueError('备份文件无效或已损坏')
+    version = raw[len(BACKUP_MAGIC)]
+    if version != BACKUP_VERSION: raise ValueError('不支持的备份文件版本')
+    start = len(BACKUP_MAGIC) + 1; salt, nonce, tag, data = raw[start:start + 16], raw[start + 16:start + 32], raw[start + 32:start + 48], raw[start + 48:]
+    try:
+        cipher = AES.new(backup_key(password, salt), AES.MODE_GCM, nonce=nonce)
+        return json.loads(cipher.decrypt_and_verify(data, tag).decode())
+    except ValueError: raise ValueError('备份密码错误或文件已损坏')
+    except (UnicodeDecodeError, json.JSONDecodeError): raise ValueError('备份文件无效或已损坏')
+
+def validate_backup(payload):
+    if not isinstance(payload, dict) or payload.get('version') != BACKUP_VERSION: raise ValueError('不支持的备份内容版本')
+    required = {
+        'plans': ('id', 'name', 'enabled', 'time_random_enabled', 'time_random_min', 'time_random_max', 'created_at'),
+        'plan_points': ('id', 'plan_id', 'at_minute', 'low_steps', 'high_steps'),
+        'accounts': ('id', 'username', 'note', 'secret', 'token_secret', 'plan_id', 'enabled', 'created_at', 'updated_at'),
+        'tasks': ('id', 'account_id', 'account_label', 'point_id', 'run_date', 'trigger', 'target_steps', 'state', 'attempts', 'available_at', 'started_at', 'finished_at', 'error', 'created_at'),
+        'daily_plan_offsets': ('account_id', 'plan_id', 'run_date', 'offsets_json', 'created_at'),
+    }
+    if not isinstance(payload.get('created_at'), str) or not isinstance(payload.get('timezone'), str): raise ValueError('备份元数据无效')
+    for name, keys in required.items():
+        rows = payload.get(name)
+        if not isinstance(rows, list) or any(not isinstance(row, dict) or set(row) != set(keys) for row in rows): raise ValueError(f'备份中的 {name} 无效')
+    settings = payload.get('settings')
+    if not isinstance(settings, dict) or set(settings) != {'id', 'proxy_secret', 'random_enabled', 'random_min', 'random_max'}: raise ValueError('备份中的设置无效')
+    def identifiers(rows, label):
+        ids = [row['id'] for row in rows]
+        if any(type(value) is not int or value < 1 for value in ids) or len(ids) != len(set(ids)): raise ValueError(f'备份中的 {label} 编号无效')
+        return set(ids)
+    plans, points, accounts, tasks = (identifiers(payload[name], name) for name in ('plans', 'plan_points', 'accounts', 'tasks'))
+    if len({row['name'] for row in payload['plans']}) != len(plans) or any(not isinstance(row['name'], str) or not row['name'] or row['enabled'] not in (0, 1) or row['time_random_enabled'] not in (0, 1) or not isinstance(row['time_random_min'], int) or not isinstance(row['time_random_max'], int) or row['time_random_min'] > row['time_random_max'] for row in payload['plans']): raise ValueError('备份中的计划无效')
+    if any(row['plan_id'] not in plans or not isinstance(row['at_minute'], int) or not 0 <= row['at_minute'] < 1440 or not isinstance(row['low_steps'], int) or row['low_steps'] < 1 or row['high_steps'] != row['low_steps'] for row in payload['plan_points']): raise ValueError('备份中的时间点无效')
+    by_plan = {}
+    for row in payload['plan_points']: by_plan.setdefault(row['plan_id'], []).append(row)
+    if any(len({row['at_minute'] for row in rows}) != len(rows) or any(rows[index]['low_steps'] < rows[index - 1]['low_steps'] for index in range(1, len(rows))) for rows in (sorted(rows, key=lambda row: row['at_minute']) for rows in by_plan.values())): raise ValueError('备份中的时间点无效')
+    if len({row['username'] for row in payload['accounts']}) != len(accounts) or any(not isinstance(row['username'], str) or not row['username'] or not isinstance(row['note'], str) or row['enabled'] not in (0, 1) or not isinstance(row['secret'], dict) or not isinstance(row['secret'].get('username'), str) or not isinstance(row['secret'].get('password'), str) or row['plan_id'] is not None and row['plan_id'] not in plans or row['token_secret'] is not None and not isinstance(row['token_secret'], dict) for row in payload['accounts']): raise ValueError('备份中的账户无效')
+    if any(row['account_id'] is not None and row['account_id'] not in accounts or row['point_id'] is not None and row['point_id'] not in points or row['state'] not in STATE_LABELS or not isinstance(row['attempts'], int) or row['attempts'] < 0 for row in payload['tasks']): raise ValueError('备份中的任务无效')
+    seen_offsets = set()
+    for row in payload['daily_plan_offsets']:
+        key = (row['account_id'], row['plan_id'], row['run_date'])
+        try: offsets = json.loads(row['offsets_json'])
+        except (TypeError, json.JSONDecodeError): raise ValueError('备份中的每日偏移无效')
+        if key in seen_offsets or row['account_id'] not in accounts or row['plan_id'] not in plans or not isinstance(row['run_date'], str) or not isinstance(offsets, dict): raise ValueError('备份中的每日偏移无效')
+        seen_offsets.add(key)
+    if settings['id'] != 1 or settings['random_enabled'] not in (0, 1) or not isinstance(settings['random_min'], int) or not isinstance(settings['random_max'], int) or settings['random_min'] > settings['random_max'] or settings['proxy_secret'] is not None and (not isinstance(settings['proxy_secret'], dict) or not isinstance(settings['proxy_secret'].get('url'), str)): raise ValueError('备份中的设置无效')
+
 class Store:
-    def __init__(self, path, key): self.path, self.key = str(path), key
+    def __init__(self, path, key):
+        self.path, self.key = str(path), key
+        self.gate, self.restoring, self.restore_thread = threading.RLock(), threading.Event(), None
+    @contextmanager
+    def operation(self, exclusive=False):
+        if self.restoring.is_set() and not exclusive and self.restore_thread != threading.get_ident(): raise RestoreBusy()
+        if not self.gate.acquire(blocking=not exclusive): raise RestoreBusy()
+        if exclusive: self.restoring.set(); self.restore_thread = threading.get_ident()
+        try: yield
+        finally:
+            if exclusive: self.restore_thread = None; self.restoring.clear()
+            self.gate.release()
+    @contextmanager
     def conn(self):
-        con = sqlite3.connect(self.path, timeout=10, isolation_level=None); con.row_factory = sqlite3.Row
-        con.execute("PRAGMA journal_mode=WAL"); con.execute("PRAGMA foreign_keys=ON"); return con
+        with self.operation():
+            con = sqlite3.connect(self.path, timeout=10, isolation_level=None); con.row_factory = sqlite3.Row
+            con.execute("PRAGMA journal_mode=WAL"); con.execute("PRAGMA foreign_keys=ON")
+            try: yield con
+            finally: con.close()
     def init(self):
         Path(self.path).parent.mkdir(parents=True, exist_ok=True)
         with self.conn() as c:
@@ -146,6 +224,46 @@ class Store:
         with self.conn() as c: c.execute("UPDATE settings SET proxy_secret=NULL WHERE id=1")
     def save_random(self, enabled, low, high):
         with self.conn() as c: c.execute("UPDATE settings SET random_enabled=?,random_min=?,random_max=? WHERE id=1", (int(enabled), low, high))
+    def backup(self, password, timezone):
+        if len(password) < 12: raise ValueError('备份密码至少需要 12 个字符')
+        with self.operation():
+            with self.conn() as c:
+                c.execute('BEGIN')
+                payload = {
+                    'version': BACKUP_VERSION, 'created_at': utcnow(), 'timezone': timezone,
+                    'plans': [dict(row) for row in c.execute('SELECT * FROM plans ORDER BY id')],
+                    'plan_points': [dict(row) for row in c.execute('SELECT * FROM plan_points ORDER BY id')],
+                    'tasks': [dict(row) for row in c.execute('SELECT * FROM tasks ORDER BY id')],
+                    'daily_plan_offsets': [dict(row) for row in c.execute('SELECT * FROM daily_plan_offsets ORDER BY account_id,plan_id,run_date')],
+                }
+                payload['accounts'] = [{**dict(row), 'secret': self.open(row['secret']), 'token_secret': self.open(row['token_secret']) if row['token_secret'] else None} for row in c.execute('SELECT * FROM accounts ORDER BY id')]
+                settings = dict(c.execute('SELECT * FROM settings WHERE id=1').fetchone())
+                payload['settings'] = {**settings, 'proxy_secret': self.open(settings['proxy_secret']) if settings['proxy_secret'] else None}
+                c.commit()
+        return encrypt_backup(payload, password)
+    def restore(self, raw, password):
+        payload = decrypt_backup(raw, password)
+        validate_backup(payload)
+        with self.operation(exclusive=True):
+            with self.conn() as c:
+                c.execute('BEGIN IMMEDIATE')
+                for table in ('tasks', 'daily_plan_offsets', 'accounts', 'plan_points', 'plans', 'settings'):
+                    c.execute(f'DELETE FROM {table}')
+                for row in payload['plans']: c.execute('INSERT INTO plans(id,name,enabled,time_random_enabled,time_random_min,time_random_max,created_at) VALUES(:id,:name,:enabled,:time_random_enabled,:time_random_min,:time_random_max,:created_at)', row)
+                for row in payload['plan_points']: c.execute('INSERT INTO plan_points(id,plan_id,at_minute,low_steps,high_steps) VALUES(:id,:plan_id,:at_minute,:low_steps,:high_steps)', row)
+                for row in payload['accounts']:
+                    row = {**row, 'secret': self.seal(row['secret']), 'token_secret': self.seal(row['token_secret']) if row['token_secret'] else None, 'enabled': 0}
+                    c.execute('INSERT INTO accounts(id,username,note,secret,token_secret,plan_id,enabled,created_at,updated_at) VALUES(:id,:username,:note,:secret,:token_secret,:plan_id,:enabled,:created_at,:updated_at)', row)
+                for row in payload['tasks']:
+                    row = {**row}
+                    if row['state'] in ('queued', 'running'):
+                        row.update(state='skipped', finished_at=utcnow(), error='备份恢复后暂停，未自动重放', started_at=None)
+                    c.execute('INSERT INTO tasks(id,account_id,account_label,point_id,run_date,trigger,target_steps,state,attempts,available_at,started_at,finished_at,error,created_at) VALUES(:id,:account_id,:account_label,:point_id,:run_date,:trigger,:target_steps,:state,:attempts,:available_at,:started_at,:finished_at,:error,:created_at)', row)
+                for row in payload['daily_plan_offsets']: c.execute('INSERT INTO daily_plan_offsets(account_id,plan_id,run_date,offsets_json,created_at) VALUES(:account_id,:plan_id,:run_date,:offsets_json,:created_at)', row)
+                settings = {**payload['settings'], 'id': 1, 'proxy_secret': self.seal(payload['settings']['proxy_secret']) if payload['settings']['proxy_secret'] else None}
+                c.execute('INSERT INTO settings(id,proxy_secret,random_enabled,random_min,random_max) VALUES(:id,:proxy_secret,:random_enabled,:random_min,:random_max)', settings)
+                c.commit()
+        return {name: len(payload[name]) for name in ('accounts', 'plans', 'tasks')}
 
 class Runner:
     def __init__(self, store, tz, delay): self.store, self.tz, self.delay = store, ZoneInfo(tz), delay
@@ -245,16 +363,17 @@ class Runner:
         except Exception as exc:
             message = safe_error(exc, self.store.proxy_url() or ''); return False, message, not message.startswith('认证失败')
     def work_once(self):
-        self.store.prune_tasks()
-        self.enqueue_scheduled(); task = self.claim()
-        if not task: return False
-        ok, msg, retryable = self.execute(task); attempt = task['attempts'] + 1
-        with self.store.conn() as c:
-            if not ok and retryable and attempt < 3:
-                wait = 60 if attempt == 1 else 300
-                c.execute("UPDATE tasks SET state='queued',available_at=?,error=?,started_at=NULL WHERE id=?", (utcnow(wait), msg, task['id']))
-            else: c.execute("UPDATE tasks SET state=?,finished_at=?,error=? WHERE id=?", ('success' if ok else 'failed', utcnow(), None if ok else msg, task['id']))
-        time.sleep(self.delay); return True
+        with self.store.operation():
+            self.store.prune_tasks()
+            self.enqueue_scheduled(); task = self.claim()
+            if not task: return False
+            ok, msg, retryable = self.execute(task); attempt = task['attempts'] + 1
+            with self.store.conn() as c:
+                if not ok and retryable and attempt < 3:
+                    wait = 60 if attempt == 1 else 300
+                    c.execute("UPDATE tasks SET state='queued',available_at=?,error=?,started_at=NULL WHERE id=?", (utcnow(wait), msg, task['id']))
+                else: c.execute("UPDATE tasks SET state=?,finished_at=?,error=? WHERE id=?", ('success' if ok else 'failed', utcnow(), None if ok else msg, task['id']))
+            time.sleep(self.delay); return True
     def loop(self):
         while True:
             try: active = self.work_once()
@@ -264,7 +383,7 @@ class Runner:
 def create_app(config=None):
     config = config or {}; secret = config.get('APP_SECRET', os.getenv('APP_SECRET', 'development-secret-change-me-32chars'))
     key = hmac.new(secret.encode(), b'credential-key', hashlib.sha256).digest()
-    app = Flask(__name__); app.config.update(SECRET_KEY=hmac.new(secret.encode(), b'session-key', hashlib.sha256).digest(), DB=config.get('DB', os.getenv('DATABASE_PATH', '/data/app.db')), ADMIN_PASSWORD=config.get('ADMIN_PASSWORD', os.getenv('ADMIN_PASSWORD', 'admin')), TZ=config.get('TZ', os.getenv('TZ', 'Asia/Shanghai')), DELAY=float(config.get('DELAY', os.getenv('REQUEST_INTERVAL_SECONDS', '5'))), COOKIE_SECURE=str(config.get('COOKIE_SECURE', os.getenv('COOKIE_SECURE', 'true'))).lower() == 'true', START_WORKER=config.get('START_WORKER', True))
+    app = Flask(__name__); app.config.update(SECRET_KEY=hmac.new(secret.encode(), b'session-key', hashlib.sha256).digest(), DB=config.get('DB', os.getenv('DATABASE_PATH', '/data/app.db')), ADMIN_PASSWORD=config.get('ADMIN_PASSWORD', os.getenv('ADMIN_PASSWORD', 'admin')), TZ=config.get('TZ', os.getenv('TZ', 'Asia/Shanghai')), DELAY=float(config.get('DELAY', os.getenv('REQUEST_INTERVAL_SECONDS', '5'))), COOKIE_SECURE=str(config.get('COOKIE_SECURE', os.getenv('COOKIE_SECURE', 'true'))).lower() == 'true', START_WORKER=config.get('START_WORKER', True), MAX_CONTENT_LENGTH=BACKUP_LIMIT + 128 * 1024)
     app.config.update(SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE='Lax', SESSION_COOKIE_SECURE=app.config['COOKIE_SECURE'])
     store, runner = Store(app.config['DB'], key), None; store.init(); runner = Runner(store, app.config['TZ'], app.config['DELAY']); app.extensions['store'], app.extensions['runner'] = store, runner
     attempts = {}
@@ -282,6 +401,7 @@ def create_app(config=None):
         session.clear(); session['admin'] = True; session['auth_version'] = auth_version(); csrf()
     @app.before_request
     def restore_admin():
+        if store.restoring.is_set() and request.endpoint not in ('health', 'static', 'import_backup'): abort(503, '正在恢复备份，请稍后重试')
         if session.get('admin') and session.get('auth_version') != auth_version(): session.clear()
         if session.get('admin') or request.endpoint in ('static', 'health', 'logout') or (request.endpoint == 'login' and request.method == 'POST'): return
         token = request.cookies.get(REMEMBER_COOKIE)
@@ -293,6 +413,8 @@ def create_app(config=None):
             if removed: issue_remember(c)
             c.commit()
         if removed: start_session()
+    @app.errorhandler(413)
+    def too_large(_): return '备份文件超过 16 MiB 限制', 413
     @app.after_request
     def remember_response(response):
         if hasattr(g, 'remember_token'):
@@ -374,8 +496,32 @@ def create_app(config=None):
     @required
     def settings_page():
         values = store.settings()
-        body = '''<div class=card><h2>SOCKS5 代理</h2><p class=muted>当前：{{proxy}}</p><form method=post action='{{url_for("save_proxy")}}' class=toolbar><label class='field grow'>代理地址<input name=proxy_url required placeholder='socks5h://[用户名:密码@]主机:端口'></label><button>保存代理</button></form><form class=inline method=post action='{{url_for("test_proxy")}}'><button class=secondary>验证已保存代理</button></form> <form class=inline method=post action='{{url_for("clear_proxy")}}'><button class=danger onclick='return confirm("清除代理设置？")'>清除代理</button></form><p class=muted>推荐 socks5h：域名解析也经代理进行。</p></div><div class=card><h2>随机步数偏移</h2><form method=post action='{{url_for("save_random")}}' class=toolbar><label><input type=checkbox name=enabled value=1 {% if values.random_enabled %}checked{% endif %}> 启用随机</label><label class=field>随机下限<input type=number name=low value='{{values.random_min}}' required placeholder='下限'></label><label class=field>随机上限<input type=number name=high value='{{values.random_max}}' required placeholder='上限'></label><button>保存随机设置</button></form><p class=muted>启用后，每个新任务的目标为固定步数加上此范围内重新抽取的随机数。</p></div>'''
+        body = '''<div class=card><h2>SOCKS5 代理</h2><p class=muted>当前：{{proxy}}</p><form method=post action='{{url_for("save_proxy")}}' class=toolbar><label class='field grow'>代理地址<input name=proxy_url required placeholder='socks5h://[用户名:密码@]主机:端口'></label><button>保存代理</button></form><form class=inline method=post action='{{url_for("test_proxy")}}'><button class=secondary>验证已保存代理</button></form> <form class=inline method=post action='{{url_for("clear_proxy")}}'><button class=danger onclick='return confirm("清除代理设置？")'>清除代理</button></form><p class=muted>推荐 socks5h：域名解析也经代理进行。</p></div><div class=card><h2>随机步数偏移</h2><form method=post action='{{url_for("save_random")}}' class=toolbar><label><input type=checkbox name=enabled value=1 {% if values.random_enabled %}checked{% endif %}> 启用随机</label><label class=field>随机下限<input type=number name=low value='{{values.random_min}}' required placeholder='下限'></label><label class=field>随机上限<input type=number name=high value='{{values.random_max}}' required placeholder='上限'></label><button>保存随机设置</button></form><p class=muted>启用后，每个新任务的目标为固定步数加上此范围内重新抽取的随机数。</p></div><div class=card><h2>灾难恢复备份</h2><p class=muted>备份包含账户凭据、计划、设置和执行记录；请将备份密码单独保管。</p><form method=post action='{{url_for("export_backup")}}' class=toolbar><label class=field>备份密码<input type=password name=password minlength=12 required autocomplete=new-password></label><label class=field>确认密码<input type=password name=confirmation minlength=12 required autocomplete=new-password></label><button>导出加密备份</button></form><hr><p class=muted>导入会完整覆盖当前业务数据。恢复的账户将全部停用，未完成任务不会自动重放。</p><form method=post action='{{url_for("import_backup")}}' enctype=multipart/form-data class=toolbar><label class=field>备份文件<input type=file name=backup accept='.stepsbak,application/octet-stream' required></label><label class=field>备份密码<input type=password name=password required autocomplete=current-password></label><label><input type=checkbox name=confirm value=overwrite required> 我确认覆盖当前全部业务数据</label><button class=danger>导入并恢复</button></form></div>'''
         return page(body, values=values, proxy=mask_proxy(store.proxy_url()))
+    @app.post('/settings/backup/export')
+    @required
+    def export_backup():
+        try:
+            if request.form.get('password') != request.form.get('confirmation'): raise ValueError('两次输入的备份密码不一致')
+            data = store.backup(request.form.get('password', ''), app.config['TZ'])
+            return send_file(io.BytesIO(data), mimetype='application/octet-stream', as_attachment=True, download_name=f"steps-{datetime.now().date().isoformat()}.stepsbak")
+        except RestoreBusy: flash('系统正在处理其他任务，请稍后重试')
+        except Exception as e: flash('导出备份失败：' + safe_error(e))
+        return redirect(url_for('settings_page'))
+    @app.post('/settings/backup/import')
+    @required
+    def import_backup():
+        try:
+            if request.form.get('confirm') != 'overwrite': raise ValueError('请确认覆盖当前全部业务数据')
+            uploaded = request.files.get('backup')
+            if not uploaded or not uploaded.filename: raise ValueError('请选择备份文件')
+            raw = uploaded.read(BACKUP_LIMIT + 1)
+            if len(raw) > BACKUP_LIMIT: raise ValueError('备份文件超过 16 MiB 限制')
+            counts = store.restore(raw, request.form.get('password', ''))
+            flash(f"恢复成功：{counts['accounts']} 个账户、{counts['plans']} 个计划、{counts['tasks']} 条记录。请核对设置后再启用账户。")
+        except RestoreBusy: flash('系统正在处理其他任务，请稍后重试')
+        except Exception as e: flash('恢复失败：' + safe_error(e))
+        return redirect(url_for('settings_page'))
     @app.post('/settings/proxy')
     @required
     def save_proxy():
@@ -421,7 +567,7 @@ def create_app(config=None):
             except Exception as e: flash('添加失败：'+str(e))
             return redirect(url_for('accounts'))
         with store.conn() as c: rows=c.execute("SELECT a.*,p.name plan_name FROM accounts a LEFT JOIN plans p ON p.id=a.plan_id ORDER BY a.id DESC").fetchall(); plans=c.execute('SELECT * FROM plans ORDER BY name').fetchall()
-        body = '''<div class=card><h2>添加账户</h2><form method=post class=grid><input type=hidden name=csrf value='{{csrf}}'><label class=field>Zepp Life 账号<input name=username placeholder='手机号或邮箱' autocomplete=username required></label><label class=field>账号密码<input name=password type=password placeholder=密码 autocomplete=new-password required></label><label class=field>账号备注<input name=note placeholder=备注></label><label class=field>分配计划<select name=plan_id><option value=''>不分配计划</option>{% for p in plans %}<option value={{p.id}}>{{p.name}}</option>{% endfor %}</select></label><button>添加</button></form></div><div class=card><h2>批量导入</h2><form method=post action='{{url_for("import_accounts")}}'><label class=field>分配计划<select name=plan_id><option value=''>不分配计划</option>{% for p in plans %}<option value={{p.id}}>{{p.name}}</option>{% endfor %}</select></label><label class=field>导入内容<textarea name=rows placeholder='每行：账号,密码,备注'></textarea></label><button>导入</button></form></div><div class=card><h2>账户</h2><form method=post action='{{url_for("manual_run")}}'><div class=toolbar><label><input id=select-all type=checkbox> 全选</label><label class=field>分配计划<select name=plan_id><option value=''>取消计划分配</option>{% for p in plans %}<option value={{p.id}}>{{p.name}}</option>{% endfor %}</select></label><button class=secondary formnovalidate formaction='{{url_for("bulk_assign_plan")}}'>批量配置计划</button></div><div class=table-wrap><table class=responsive><thead><tr><th></th><th>账号</th><th>备注/计划</th><th>状态</th><th>操作</th></tr></thead><tbody>{% for a in rows %}<tr><td data-label=选择><input aria-label="选择 {{mask(a.username)}}" class=account-select type=checkbox name=account_id value={{a.id}}></td><td data-label=账号>{{mask(a.username)}}</td><td data-label=备注/计划>{{a.note}}<br><span class=muted>{{a.plan_name or '未分配'}}</span></td><td data-label=状态><span class=badge>{{'启用' if a.enabled else '停用'}}</span></td><td data-label=操作 class=actions><a class=link href='{{url_for("account_today",aid=a.id)}}'>今日计划</a> <a class=link href='{{url_for("edit_account",aid=a.id)}}'>编辑</a> <button formnovalidate formaction='{{url_for("test_account",aid=a.id)}}'>测试</button><button class=secondary formnovalidate formaction='{{url_for("toggle_account",aid=a.id)}}'>{{'停用' if a.enabled else '启用'}}</button><button class=danger formnovalidate formaction='{{url_for("delete_account",aid=a.id)}}' onclick='return confirm("删除账户及其凭据？")'>删除</button></td></tr>{% else %}<tr><td colspan=5 class=empty>还没有账户，先添加或批量导入。</td></tr>{% endfor %}</tbody></table></div><div class=toolbar><span class=muted>手动执行仅处理启用账户。</span><span class=spacer></span><label class=field>固定步数<input name=steps type=number min=1 required placeholder=固定步数></label><button>执行选中账户</button></div></form></div><script>document.getElementById('select-all')?.addEventListener('change',function(){document.querySelectorAll('.account-select').forEach(function(box){box.checked=this.checked},this)})</script>'''
+        body = '''<div class=card><h2>添加账户</h2><form method=post class=grid><input type=hidden name=csrf value='{{csrf}}'><label class=field>Zepp Life 账号<input name=username placeholder='手机号或邮箱' autocomplete=username required></label><label class=field>账号密码<input name=password type=password placeholder=密码 autocomplete=new-password required></label><label class=field>账号备注<input name=note placeholder=备注></label><label class=field>分配计划<select name=plan_id><option value=''>不分配计划</option>{% for p in plans %}<option value={{p.id}}>{{p.name}}</option>{% endfor %}</select></label><button>添加</button></form></div><div class=card><h2>批量导入</h2><form method=post action='{{url_for("import_accounts")}}'><label class=field>分配计划<select name=plan_id><option value=''>不分配计划</option>{% for p in plans %}<option value={{p.id}}>{{p.name}}</option>{% endfor %}</select></label><label class=field>导入内容<textarea name=rows placeholder='每行：账号,密码,备注'></textarea></label><button>导入</button></form></div><div class=card><h2>账户</h2><form method=post action='{{url_for("manual_run")}}'><div class=toolbar><label><input id=select-all type=checkbox> 全选</label><label class=field>分配计划<select name=plan_id><option value=''>取消计划分配</option>{% for p in plans %}<option value={{p.id}}>{{p.name}}</option>{% endfor %}</select></label><button class=secondary formnovalidate formaction='{{url_for("bulk_assign_plan")}}'>批量配置计划</button><button class=secondary formnovalidate formaction='{{url_for("bulk_enable_accounts")}}'>批量启用</button></div><div class=table-wrap><table class=responsive><thead><tr><th></th><th>账号</th><th>备注/计划</th><th>状态</th><th>操作</th></tr></thead><tbody>{% for a in rows %}<tr><td data-label=选择><input aria-label="选择 {{mask(a.username)}}" class=account-select type=checkbox name=account_id value={{a.id}}></td><td data-label=账号>{{mask(a.username)}}</td><td data-label=备注/计划>{{a.note}}<br><span class=muted>{{a.plan_name or '未分配'}}</span></td><td data-label=状态><span class=badge>{{'启用' if a.enabled else '停用'}}</span></td><td data-label=操作 class=actions><a class=link href='{{url_for("account_today",aid=a.id)}}'>今日计划</a> <a class=link href='{{url_for("edit_account",aid=a.id)}}'>编辑</a> <button formnovalidate formaction='{{url_for("test_account",aid=a.id)}}'>测试</button><button class=secondary formnovalidate formaction='{{url_for("toggle_account",aid=a.id)}}'>{{'停用' if a.enabled else '启用'}}</button><button class=danger formnovalidate formaction='{{url_for("delete_account",aid=a.id)}}' onclick='return confirm("删除账户及其凭据？")'>删除</button></td></tr>{% else %}<tr><td colspan=5 class=empty>还没有账户，先添加或批量导入。</td></tr>{% endfor %}</tbody></table></div><div class=toolbar><span class=muted>手动执行仅处理启用账户。</span><span class=spacer></span><label class=field>固定步数<input name=steps type=number min=1 required placeholder=固定步数></label><button>执行选中账户</button></div></form></div><script>document.getElementById('select-all')?.addEventListener('change',function(){document.querySelectorAll('.account-select').forEach(function(box){box.checked=this.checked},this)})</script>'''
         return page(body, rows=rows, plans=plans)
     @app.get('/accounts/<int:aid>/today')
     @required
@@ -475,6 +621,17 @@ def create_app(config=None):
                 count = c.execute(f'UPDATE accounts SET plan_id=?,updated_at=? WHERE id IN ({marks})', (plan_id, utcnow(), *ids)).rowcount
             flash(f'已更新 {count} 个账户的计划')
         except Exception as e: flash('批量配置失败：' + str(e))
+        return redirect(url_for('accounts'))
+    @app.post('/accounts/enable')
+    @required
+    def bulk_enable_accounts():
+        ids = request.form.getlist('account_id')
+        try:
+            if not ids: raise ValueError('请至少选择一个账户')
+            marks = ','.join('?' for _ in ids)
+            with store.conn() as c: count = c.execute(f'UPDATE accounts SET enabled=1,updated_at=? WHERE id IN ({marks})', (utcnow(), *ids)).rowcount
+            flash(f'已启用 {count} 个账户')
+        except Exception as e: flash('批量启用失败：' + str(e))
         return redirect(url_for('accounts'))
     @app.post('/accounts/<int:aid>/toggle')
     @required

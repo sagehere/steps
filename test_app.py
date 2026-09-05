@@ -1,4 +1,5 @@
 import tempfile
+import io
 import unittest
 import warnings
 import inspect
@@ -33,6 +34,40 @@ class AppTests(unittest.TestCase):
         with self.assertRaises(ValueError): parse_proxy_url('http://127.0.0.1:1080')
         for name in ('login_access_token', 'grant_login_tokens', 'grant_app_token', 'check_app_token', 'renew_login_token', 'get_user_device_id', 'post_fake_brand_data'):
             self.assertIn('client', inspect.signature(getattr(zepp_helper, name)).parameters)
+    def test_encrypted_backup_restores_with_a_new_app_secret(self):
+        self.login(); csrf = self.csrf()
+        app, store = self.app.application, self.app.application.extensions['store']
+        with store.conn() as c:
+            c.execute("INSERT INTO plans(name,created_at) VALUES('backup',?)", (utcnow(),)); pid = c.execute('SELECT id FROM plans').fetchone()[0]
+            c.execute('INSERT INTO plan_points(plan_id,at_minute,low_steps,high_steps) VALUES(?,?,?,?)', (pid, 600, 3000, 3000))
+            point = c.execute('SELECT id FROM plan_points').fetchone()[0]
+            c.execute("INSERT INTO accounts(username,secret,token_secret,plan_id,created_at,updated_at) VALUES(?,?,?,?,?,?)", ('backup@example.com', store.seal({'username':'backup@example.com','password':'secret'}), store.seal({'app_token':'token'}), pid, utcnow(), utcnow())); aid = c.execute('SELECT id FROM accounts').fetchone()[0]
+            c.execute("INSERT INTO tasks(account_id,account_label,point_id,run_date,trigger,state,available_at,created_at) VALUES(?,?,?,'2026-09-05','计划','queued',?,?)", (aid, 'backup', point, utcnow(), utcnow()))
+        store.save_proxy('socks5h://proxy.example:1080')
+        exported = self.app.post('/settings/backup/export', data={'csrf':csrf, 'password':'correct horse battery', 'confirmation':'correct horse battery'})
+        self.assertEqual(exported.status_code, 200); self.assertTrue(exported.data.startswith(b'STEPSBAK1'))
+        target = tempfile.NamedTemporaryFile(suffix='.db', delete=False); target.close()
+        restored = create_app({'DB':target.name, 'APP_SECRET':'y'*40, 'ADMIN_PASSWORD':'pass', 'COOKIE_SECURE':False, 'START_WORKER':False}).test_client()
+        restored.post('/login', data={'password':'pass'})
+        with restored.session_transaction() as session: target_csrf = session['csrf']
+        response = restored.post('/settings/backup/import', data={'csrf':target_csrf, 'password':'correct horse battery', 'confirm':'overwrite', 'backup':(io.BytesIO(exported.data), 'backup.stepsbak')}, content_type='multipart/form-data', follow_redirects=True)
+        self.assertIn('恢复成功', response.data.decode())
+        target_store = restored.application.extensions['store']
+        with target_store.conn() as c:
+            account = c.execute('SELECT * FROM accounts').fetchone()
+            self.assertEqual(account['enabled'], 0); self.assertEqual(c.execute('SELECT state FROM tasks').fetchone()[0], 'skipped')
+        self.assertEqual(target_store.open(account['secret'])['password'], 'secret')
+        self.assertEqual(target_store.proxy_url(), 'socks5h://proxy.example:1080')
+    def test_invalid_backup_does_not_change_current_data(self):
+        store = self.app.application.extensions['store']
+        with store.conn() as c:
+            c.execute("INSERT INTO accounts(username,secret,created_at,updated_at) VALUES(?,?,?,?)", ('current@example.com', store.seal({'username':'current@example.com','password':'p'}), utcnow(), utcnow()))
+        backup = store.backup('correct horse battery', 'Asia/Shanghai')
+        with self.assertRaises(ValueError): store.restore(backup[:-1], 'correct horse battery')
+        with self.assertRaises(ValueError): store.restore(backup, 'wrong password')
+        with store.conn() as c: self.assertEqual(c.execute('SELECT username FROM accounts').fetchone()[0], 'current@example.com')
+    def csrf(self):
+        with self.app.session_transaction() as session: return session['csrf']
     def test_utcnow_is_warning_free(self):
         with warnings.catch_warnings():
             warnings.simplefilter('error', DeprecationWarning)
