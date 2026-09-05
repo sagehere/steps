@@ -4,9 +4,11 @@ import warnings
 import inspect
 import json
 import sqlite3
+import hashlib
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from unittest.mock import MagicMock, patch
-from app import create_app, localtime, minute, parse_proxy_url, parse_random_range, parse_steps, utcnow
+from app import REMEMBER_COOKIE, REMEMBER_SECONDS, create_app, localtime, minute, parse_proxy_url, parse_random_range, parse_steps, utcnow
 from vendor.util import zepp_helper
 
 class AppTests(unittest.TestCase):
@@ -112,7 +114,8 @@ class AppTests(unittest.TestCase):
     def test_responsive_account_and_history_markup(self):
         self.login()
         accounts = self.app.get('/accounts').data.decode(); history = self.app.get('/history').data.decode()
-        self.assertIn('@media(max-width:700px)', accounts)
+        self.assertIn('/static/app.css', accounts)
+        self.assertIn('@media(max-width:700px)', self.app.get('/static/app.css').data.decode())
         self.assertIn('id=select-all', accounts)
         self.assertIn('class=responsive', accounts)
         self.assertIn('name=account_id', history)
@@ -238,5 +241,185 @@ class AppTests(unittest.TestCase):
         later = datetime(2026, 9, 2, 10, 10, tzinfo=runner.tz)
         with patch.object(runner, 'now', return_value=later): runner.enqueue_scheduled()
         with store.conn() as c: self.assertEqual(c.execute('SELECT state FROM tasks WHERE account_id=? AND target_steps=100', (aid,)).fetchone()[0], 'skipped')
+
+class DashboardAndAuthTests(unittest.TestCase):
+    setUp = AppTests.setUp
+
+    def remember(self, client=None):
+        client = client or self.app
+        response = client.post('/login', data={'password': 'pass', 'remember': '1'})
+        return client.get_cookie(REMEMBER_COOKIE).value, response
+
+    def csrf(self, client=None):
+        with (client or self.app).session_transaction() as session: return session['csrf']
+
+    def test_normal_and_remember_cookie_security(self):
+        self.app.post('/login', data={'password': 'pass'})
+        self.assertIsNone(self.app.get_cookie(REMEMBER_COOKIE))
+        self.assertIsNone(self.app.get_cookie('session').expires)
+        token, response = self.remember()
+        cookie = self.app.get_cookie(REMEMBER_COOKIE)
+        self.assertTrue(cookie.http_only); self.assertEqual(cookie.same_site, 'Lax')
+        self.assertEqual(cookie.max_age, REMEMBER_SECONDS)
+        with self.app.application.extensions['store'].conn() as c:
+            row = c.execute('SELECT * FROM admin_credentials').fetchone()
+            self.assertNotEqual(row['token_hash'], token)
+            self.assertEqual(row['token_hash'], hashlib.sha256(token.encode()).hexdigest())
+        self.app.application.config['COOKIE_SECURE'] = True
+        _, response = self.remember()
+        self.assertTrue(any('Secure' in value for value in response.headers.getlist('Set-Cookie') if value.startswith(REMEMBER_COOKIE)))
+        self.assertEqual(response.headers['Cache-Control'], 'no-store')
+
+    def test_restore_rotates_extends_and_rejects_replay(self):
+        token, _ = self.remember(); old_csrf = self.csrf()
+        self.app.delete_cookie('session')
+        next_login, new_expiry = utcnow(86400), utcnow(86400 + REMEMBER_SECONDS)
+        with patch('app.utcnow', side_effect=lambda delay=0: new_expiry if delay else next_login):
+            response = self.app.get('/')
+        self.assertEqual(response.status_code, 200)
+        new_token = self.app.get_cookie(REMEMBER_COOKIE).value
+        self.assertNotEqual(new_token, token); self.assertNotEqual(self.csrf(), old_csrf)
+        with self.app.application.extensions['store'].conn() as c:
+            self.assertEqual(c.execute('SELECT expires_at FROM admin_credentials').fetchone()[0], new_expiry)
+        self.app.get('/')
+        self.assertEqual(self.app.get_cookie(REMEMBER_COOKIE).value, new_token)
+        replay = self.app.application.test_client(); replay.set_cookie(REMEMBER_COOKIE, token)
+        response = replay.get('/dashboard/timeline')
+        self.assertEqual(response.status_code, 302)
+        self.assertFalse(any(value.startswith(REMEMBER_COOKIE) for value in response.headers.getlist('Set-Cookie')))
+        self.assertEqual(self.app.post('/run', data={'csrf': old_csrf}).status_code, 400)
+
+    def test_expired_forged_and_password_change(self):
+        self.remember()
+        with self.app.application.extensions['store'].conn() as c: c.execute("UPDATE admin_credentials SET expires_at='2000-01-01T00:00:00'")
+        self.app.delete_cookie('session'); self.assertEqual(self.app.get('/').status_code, 302)
+        self.app.set_cookie(REMEMBER_COOKIE, 'forged'); self.assertEqual(self.app.get('/').status_code, 302)
+        self.remember(); self.app.application.config['ADMIN_PASSWORD'] = 'changed'
+        self.assertEqual(self.app.get('/').status_code, 302)
+        self.app.delete_cookie('session'); self.assertEqual(self.app.get('/').status_code, 302)
+        with self.app.application.extensions['store'].conn() as c:
+            self.assertEqual(c.execute('SELECT count(*) FROM admin_credentials').fetchone()[0], 0)
+
+    def test_logout_and_password_login_revoke_only_current_browser(self):
+        self.assertEqual(self.app.post('/logout').status_code, 400)
+        old, _ = self.remember(); other = self.app.application.test_client(); other_token, _ = self.remember(other)
+        csrf = self.csrf()
+        self.assertEqual(self.app.post('/logout', data={'csrf': csrf}).status_code, 302)
+        self.assertIsNone(self.app.get_cookie(REMEMBER_COOKIE))
+        with self.app.application.extensions['store'].conn() as c:
+            self.assertEqual(c.execute('SELECT count(*) FROM admin_credentials').fetchone()[0], 1)
+        other.delete_cookie('session'); self.assertEqual(other.get('/').status_code, 200)
+        self.remember(); self.app.post('/login', data={'password': 'pass'})
+        self.assertIsNone(self.app.get_cookie(REMEMBER_COOKIE))
+        with self.app.application.extensions['store'].conn() as c:
+            self.assertEqual(c.execute('SELECT count(*) FROM admin_credentials').fetchone()[0], 1)
+
+    def test_concurrent_token_redemption_has_one_winner(self):
+        token, _ = self.remember()
+        def restore(_):
+            client = self.app.application.test_client(); client.set_cookie(REMEMBER_COOKIE, token)
+            response = client.get('/dashboard/timeline')
+            return response.status_code, response.headers.getlist('Set-Cookie')
+        with ThreadPoolExecutor(max_workers=2) as pool: results = list(pool.map(restore, range(2)))
+        self.assertEqual(sorted(status for status, _ in results), [200, 302])
+        for status, cookies in results:
+            if status == 302: self.assertFalse(any(cookie.startswith(REMEMBER_COOKIE) for cookie in cookies))
+        with self.app.application.extensions['store'].conn() as c: self.assertEqual(c.execute('SELECT count(*) FROM admin_credentials').fetchone()[0], 1)
+
+    def seed_timeline(self):
+        self.app.post('/login', data={'password': 'pass'})
+        store = self.app.application.extensions['store']; runner = self.app.application.extensions['runner']
+        with store.conn() as c:
+            for name in ('A plan', 'B disabled'):
+                c.execute('INSERT INTO plans(name,enabled,created_at) VALUES(?,?,?)', (name, name == 'A plan', utcnow()))
+            for at in (0, 120, 240, 360, 480, 600, 720, 1439):
+                c.execute('INSERT INTO plan_points(plan_id,at_minute,low_steps,high_steps) VALUES(1,?,?,?)', (at, 100 + at, 100 + at))
+            c.execute('INSERT INTO plan_points(plan_id,at_minute,low_steps,high_steps) VALUES(2,600,100,100)')
+            for index, plan_id in enumerate((1, 1, 2, None), 1):
+                c.execute('INSERT INTO accounts(username,note,secret,plan_id,enabled,created_at,updated_at) VALUES(?,?,?,?,?,?,?)', (f'account{index}@example.com', '<script>unsafe</script> {{7*7}} 备注', 'never-return-this-secret', plan_id, index != 2, utcnow(), utcnow()))
+            for point_id, state, attempts in ((1, 'success', 1), (2, 'failed', 3), (3, 'queued', 1), (4, 'running', 1), (5, 'skipped', 0)):
+                c.execute("INSERT INTO tasks(account_id,account_label,point_id,run_date,trigger,state,attempts,available_at,created_at) VALUES(1,'a',?,'2026-09-05','计划',?,?,?,?)", (point_id, state, attempts, utcnow(), utcnow()))
+            for trigger in ('手动', '测试'):
+                c.execute("INSERT INTO tasks(account_id,account_label,run_date,trigger,available_at,created_at) VALUES(1,'a','2026-09-05',?,?,?)", (trigger, utcnow(), utcnow()))
+        return runner, datetime(2026, 9, 5, 10, 0, tzinfo=runner.tz)
+
+    def test_timeline_auth_empty_filter_colors_and_safe_payload(self):
+        self.assertEqual(self.app.get('/dashboard/timeline').status_code, 302)
+        self.app.post('/login', data={'password': 'pass'})
+        self.assertEqual(self.app.get('/dashboard/timeline').json['points'], [])
+        runner, now = self.seed_timeline()
+        with patch.object(runner, 'now', return_value=now):
+            response = self.app.get('/dashboard/timeline'); payload = response.json
+            self.assertEqual(payload['date'], '2026-09-05'); self.assertEqual(payload['timezone'], 'Asia/Shanghai')
+            self.assertEqual(len(payload['points']), 17)
+            rows = payload['points'][:8]
+            self.assertEqual([row['color'] for row in rows], ['green', 'red'] + ['gray'] * 6)
+            self.assertEqual([row['status'] for row in rows], ['成功', '失败', '重试等待', '执行中', '已跳过', '待调度', '待执行', '待执行'])
+            self.assertTrue(all(row['status'] == '不会自动执行' for row in payload['points'][8:]))
+            self.assertEqual(len(self.app.get('/dashboard/timeline?plan_id=2').json['points']), 1)
+            self.assertEqual(self.app.get('/dashboard/timeline?plan_id=999').status_code, 404)
+            self.assertEqual(self.app.get('/dashboard/timeline?plan_id=bad').status_code, 400)
+            self.assertEqual(rows[0]['final_minute'], 0); self.assertEqual(rows[-1]['final_minute'], 1439)
+            page = self.app.get('/').data.decode()
+            self.assertNotIn('<script>unsafe</script>', page)
+            self.assertNotIn('never-return-this-secret', response.data.decode())
+            self.assertNotIn('account1@example.com', response.data.decode())
+            self.assertEqual(rows[0]['note'], '<script>unsafe</script> {{7*7}} 备注')
+
+    def test_timeline_snapshot_reuse_and_next_day_changes(self):
+        runner, now = self.seed_timeline(); store = self.app.application.extensions['store']
+        with store.conn() as c:
+            c.execute('DELETE FROM tasks'); c.execute('DELETE FROM plan_points WHERE at_minute IN (0,1439)')
+            c.execute('UPDATE plans SET time_random_enabled=1,time_random_min=-5,time_random_max=5 WHERE id=1')
+        with patch.object(runner, 'now', return_value=now), patch('app.random.randint', return_value=3):
+            first = self.app.get('/dashboard/timeline?plan_id=1').json
+        with patch.object(runner, 'now', return_value=now), patch('app.random.randint', side_effect=AssertionError('must reuse snapshot')):
+            self.assertEqual(first, self.app.get('/dashboard/timeline?plan_id=1').json)
+            page = self.app.get('/accounts/1/today').data.decode()
+            self.assertIn('02:03', page)
+            runner.enqueue_scheduled()
+            with store.conn() as c:
+                c.execute('INSERT INTO plan_points(plan_id,at_minute,low_steps,high_steps) VALUES(1,800,1000,1000)')
+            self.assertEqual(len(self.app.get('/dashboard/timeline?plan_id=1').json['points']), 12)
+        tomorrow = datetime(2026, 9, 6, 0, 0, tzinfo=runner.tz)
+        with patch.object(runner, 'now', return_value=tomorrow), patch('app.random.randint', return_value=-2):
+            payload = self.app.get('/dashboard/timeline?plan_id=1').json
+            self.assertEqual(payload['date'], '2026-09-06'); self.assertEqual(payload['now_minute'], 0)
+            self.assertEqual(len(payload['points']), 14)
+            self.assertEqual(payload['points'][0]['final_minute'], 118)
+            self.assertNotEqual(payload['points'][0]['id'], first['points'][0]['id'])
+
+    def test_missed_deleted_points_and_other_timezone(self):
+        runner, now = self.seed_timeline(); store = self.app.application.extensions['store']
+        from zoneinfo import ZoneInfo
+        self.app.application.config['TZ'] = 'America/New_York'; runner.tz = ZoneInfo('America/New_York')
+        midnight = datetime(2026, 9, 4, 23, 59, tzinfo=runner.tz)
+        with patch.object(runner, 'now', return_value=midnight):
+            payload = self.app.get('/dashboard/timeline').json
+            self.assertEqual(payload['date'], '2026-09-04')
+            self.assertEqual(payload['points'][0]['status'], '已错过')
+            with store.conn() as c: c.execute('DELETE FROM plan_points WHERE id=1')
+            self.assertEqual(len(self.app.get('/dashboard/timeline').json['points']), 15)
+
+    def test_failed_login_does_not_issue_token_and_restart_preserves_valid_token(self):
+        self.app.post('/login', data={'password': 'wrong', 'remember': '1'})
+        self.assertIsNone(self.app.get_cookie(REMEMBER_COOKIE))
+        token, _ = self.remember()
+        config = {key: self.app.application.config[key] for key in ('DB', 'ADMIN_PASSWORD', 'START_WORKER', 'TZ', 'COOKIE_SECURE')}
+        config['APP_SECRET'] = 'x' * 40
+        restarted = create_app(config).test_client(); restarted.set_cookie(REMEMBER_COOKIE, token)
+        self.assertEqual(restarted.get('/').status_code, 200)
+        self.assertNotEqual(restarted.get_cookie(REMEMBER_COOKIE).value, token)
+
+    def test_task_completion_changes_color_without_moving_point(self):
+        runner, now = self.seed_timeline(); store = self.app.application.extensions['store']
+        with patch.object(runner, 'now', return_value=now):
+            first = self.app.get('/dashboard/timeline?plan_id=1').json['points'][2]
+            with store.conn() as c:
+                c.execute("UPDATE tasks SET state='success',started_at=?,finished_at=? WHERE point_id=3", (utcnow(), utcnow()))
+            last = self.app.get('/dashboard/timeline?plan_id=1').json['points'][2]
+        self.assertEqual(last['final_minute'], first['final_minute'])
+        self.assertEqual(first['color'], 'gray'); self.assertEqual(last['color'], 'green')
+
 
 if __name__ == '__main__': unittest.main()

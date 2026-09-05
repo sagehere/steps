@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Zepp Life 步数计划</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='app.css') }}">
+</head>
+{% set section = request.path.split('/')[1] %}
+{% set navigation = [('dashboard', '', '仪表盘', '◷', '今日概览', '让每一天的计划，清晰有序。'), ('accounts', 'accounts', '账户', '◎', '账户管理', '集中管理账号、备注与执行计划。'), ('plans', 'plans', '计划', '▦', '步数计划', '安排每日节奏，让执行井然有序。'), ('history', 'history', '执行记录', '≡', '执行记录', '查看每一次执行的结果与详情。'), ('settings_page', 'settings', '设置', '⚙', '偏好设置', '配置连接方式与随机步数偏移。')] %}
+<body class="{{ 'authenticated' if session.get('admin') else 'login-page' }}">
+{% if session.get('admin') %}
+  <aside class="sidebar">
+    <a class="brand" href="{{url_for('dashboard')}}"><span class="brand-icon" aria-hidden="true">Z</span><span>Zepp Life<small>步数计划管理</small></span></a>
+    <span class="nav-caption">工作空间</span>
+    <nav class="nav" aria-label="主导航">
+    {% for endpoint, key, label, icon, title, description in navigation %}
+      <a href="{{url_for(endpoint)}}" {% if section == key %}class="active" aria-current="page"{% endif %}><span aria-hidden="true">{{icon}}</span>{{label}}</a>
+    {% endfor %}
+    </nav>
+    <div class="sidebar-footer"><span class="avatar" aria-hidden="true">A</span><div><strong>管理员</strong><small>私有工作空间</small></div><form method="post" action="{{url_for('logout')}}"><input type=hidden name=csrf value='{{csrf}}'><button class="logout" aria-label="退出登录" title="退出登录">退出</button></form></div>
+  </aside>
+{% endif %}
+<main class="shell" id="main">
+{% if session.get('admin') %}
+  <header class="page-header">
+    <div><div class="eyebrow">ZEPP LIFE / 工作空间</div>{% for endpoint, key, label, icon, title, description in navigation %}{% if section == key %}<h1>{{title}}</h1><p>{{description}}</p>{% endif %}{% endfor %}</div>
+    <span class="workspace-tag"><span aria-hidden="true">●</span> 私有管理中心</span>
+  </header>
+{% endif %}
+{% with messages=get_flashed_messages() %}{% for message in messages %}<div class="flash" role="status">{{message}}</div>{% endfor %}{% endwith %}
+{{body|safe}}
+<footer class="page-footer">Zepp Life 步数计划 <span>按自己的节奏，完成每一天。</span></footer>
+</main>
+</body>
+</html>

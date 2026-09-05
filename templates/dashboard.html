@@ -1,0 +1,17 @@
+<div class="stats-grid">
+{% for key, label, icon, hint in [('accounts', '启用账户', '◎', '正在管理的运动账号'), ('plans', '启用计划', '▦', '按日自动安排执行'), ('queued', '排队任务', '◷', '等待后台依次处理'), ('failed', '今日失败', '!', '可在执行记录中重试')] %}
+  <section class="card stat {{key}}"><div class="stat-heading"><span>{{label}}</span><span class="stat-icon" aria-hidden="true">{{icon}}</span></div><h2>{{stats[key]}}</h2><p>{{hint}}</p></section>
+{% endfor %}
+</div>
+<section class="card timeline-card" id="timeline" data-url="{{url_for('dashboard_timeline')}}" data-login="{{url_for('login')}}">
+  <div class="card-heading"><div><span class="eyebrow">DAILY SCHEDULE</span><h2>今日执行时间轴</h2><p class="muted" id="timeline-date">正在加载当天计划…</p></div><div class="timeline-controls"><div class="segmented" role="group" aria-label="时间轴视图"><button type="button" id="view-all" aria-pressed="true">全部</button><button type="button" id="view-plan" aria-pressed="false">按计划查看</button></div><select id="timeline-plan" aria-label="选择计划" hidden></select><button class="secondary refresh" type="button" id="timeline-refresh" aria-label="刷新时间轴">刷新</button></div></div>
+  <div class="timeline-legend"><span><i class="legend-dot gray"></i>未完成</span><span><i class="legend-dot green"></i>执行成功</span><span><i class="legend-dot red"></i>执行失败</span><span class="legend-help">悬停或点击圆点查看账号备注</span></div>
+  <div class="timeline-scroll" tabindex="0" aria-label="全天执行时间轴，可滚动"><div class="timeline-plot" id="timeline-plot" role="group" aria-label="账号计划时间点"></div></div>
+  <p class="empty" id="timeline-empty" hidden>当天暂无计划时间点，请先为账户分配包含时间点的计划。</p>
+  <div class="timeline-detail" id="timeline-detail" role="status" hidden></div>
+  <div class="timeline-footer"><span>时间点采用当天固定的随机偏移</span><span id="timeline-status" role="status">每 30 秒自动更新</span></div>
+  <noscript><p class="flash">请启用 JavaScript 查看时间轴，或在账户页面查看今日计划。</p></noscript>
+</section>
+<section class="card"><div class="card-heading"><div><h2>最近任务</h2><p class="muted">最近 12 条执行记录</p></div><a class="link" href="{{url_for('history')}}">查看全部 <span aria-hidden="true">→</span></a></div>
+<div class="table-wrap"><table class="responsive"><thead><tr><th>账户</th><th>来源</th><th>目标步数</th><th>状态</th><th>详情</th></tr></thead><tbody>{% for task in recent %}<tr><td data-label="账户">{{task.account_label}}</td><td data-label="来源">{{task.trigger}}</td><td data-label="目标步数">{{task.target_steps or '—'}}</td><td data-label="状态"><span class="badge {{task.state}}">{{state_labels.get(task.state,task.state)}}</span></td><td data-label="详情" class="{{'bad' if task.state=='failed' else 'muted'}}">{{task.error or '—'}}</td></tr>{% else %}<tr><td colspan="5" class="empty">暂无任务，添加账号和计划后即可开始。</td></tr>{% endfor %}</tbody></table></div></section>
+<script src="{{url_for('static', filename='timeline.js')}}" defer></script>
