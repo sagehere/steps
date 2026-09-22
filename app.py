@@ -1,4 +1,4 @@
-﻿"""Private Zepp Life step scheduler.  Protocol helper derives from mimotion."""
+"""Private Zepp Life step scheduler.  Protocol helper derives from mimotion."""
 from __future__ import annotations
 
 import base64
@@ -44,6 +44,7 @@ CREATE TABLE IF NOT EXISTS admin_credentials (token_hash TEXT PRIMARY KEY, expir
 REMEMBER_COOKIE = 'admin_remember'
 REMEMBER_SECONDS = 30 * 24 * 60 * 60
 STATE_LABELS = {'queued': '排队中', 'running': '执行中', 'success': '成功', 'failed': '失败', 'skipped': '已跳过'}
+FALLBACK_DEVICE_ID = 'DA932FFFFE8816E7'
 BACKUP_MAGIC = b'STEPSBAK1'
 BACKUP_VERSION = 1
 BACKUP_LIMIT = 16 * 1024 * 1024
@@ -327,6 +328,8 @@ class Runner:
             if row: c.execute("UPDATE tasks SET state='running',attempts=attempts+1,started_at=? WHERE id=?", (utcnow(), row['id']))
             c.commit(); return row
     def credentials(self, account): return self.store.open(account['secret']), self.store.open(account['token_secret']) if account['token_secret'] else {}
+    def save_tokens(self, account_id, tokens):
+        with self.store.conn() as c: c.execute("UPDATE accounts SET token_secret=?,updated_at=? WHERE id=?", (self.store.seal(tokens), utcnow(), account_id))
     def authenticate(self, account, client):
         secret, tokens = self.credentials(account); user, password = secret['username'], secret['password']
         user = user if user.startswith('+86') or '@' in user else '+86' + user; phone = user.startswith('+86')
@@ -348,18 +351,47 @@ class Runner:
             tokens.update(access_token=access, login_token=login); ok = True
         tokens.update(app_token=app_token, user_id=uid, device_id=device)
         if not uid or not app_token: raise ValueError("认证失败：缺少有效身份信息")
-        if not tokens.get('bound_device_id'):
-            tokens['bound_device_id'] = zepp_helper.get_user_device_id(app_token, uid, client=client)
-        with self.store.conn() as c: c.execute("UPDATE accounts SET token_secret=?,updated_at=? WHERE id=?", (self.store.seal(tokens), utcnow(), account['id']))
-        return app_token, uid, tokens.get('bound_device_id')
+        self.save_tokens(account['id'], tokens)
+        return app_token, uid, tokens
+    def device_for_upload(self, account, client):
+        app_token, uid, tokens = self.authenticate(account, client)
+        try:
+            devices = zepp_helper.get_device_list(app_token, uid, client=client)
+        except ValueError as exc:
+            return app_token, uid, FALLBACK_DEVICE_ID, "设备查询失败，已使用 fallback device：" + str(exc)
+        if devices:
+            device_id = devices[0].get('deviceid')
+            if not device_id: raise ValueError("设备列表响应无效：缺少设备 ID")
+            tokens['bound_device_id'] = str(device_id).replace(':', '').upper()
+            self.save_tokens(account['id'], tokens)
+            return app_token, uid, tokens['bound_device_id'], None
+        device_id = tokens.get('virtual_device_id')
+        device_mac = tokens.get('virtual_device_mac')
+        if not device_id or not device_mac:
+            device_id = secrets.token_hex(8).upper()
+            device_mac = ':'.join(secrets.token_hex(6).upper()[index:index + 2] for index in range(0, 12, 2))
+            tokens.update(virtual_device_id=device_id, virtual_device_mac=device_mac)
+            self.save_tokens(account['id'], tokens)
+        try:
+            zepp_helper.bind_virtual_device(app_token, uid, device_mac, device_id, client=client)
+        except ValueError as exc:
+            return app_token, uid, FALLBACK_DEVICE_ID, "自动绑定失败，已使用 fallback device：" + str(exc)
+        tokens['bound_device_id'] = device_id
+        self.save_tokens(account['id'], tokens)
+        return app_token, uid, device_id, None
     def execute(self, task):
         with self.store.conn() as c: account = c.execute("SELECT * FROM accounts WHERE id=?", (task['account_id'],)).fetchone()
         if not account: return False, "账户已删除", False
         try:
-            client = self.client(); app_token, uid, device = self.authenticate(account, client)
-            if task['trigger'] == '测试': return True, "登录和设备检查成功", False
+            client = self.client()
+            if task['trigger'] == '测试':
+                app_token, uid, _ = self.authenticate(account, client)
+                devices = zepp_helper.get_device_list(app_token, uid, client=client)
+                return True, "登录和设备检查成功" if devices else "登录成功，当前账户尚无绑定设备", False
+            app_token, uid, device, binding_note = self.device_for_upload(account, client)
             ok, message = zepp_helper.post_fake_brand_data(str(task['target_steps']), app_token, uid, device, client=client)
-            return ok, ("提交成功" if ok else "提交失败：" + str(message)), not ok and any(x in str(message) for x in ('429', '500', '502', '503', '504'))
+            detail = binding_note or ("提交成功" if ok else "提交失败：" + str(message))
+            return ok, detail, not ok and any(x in str(message) for x in ('429', '500', '502', '503', '504'))
         except Exception as exc:
             message = safe_error(exc, self.store.proxy_url() or ''); return False, message, not message.startswith('认证失败')
     def work_once(self):
@@ -739,3 +771,4 @@ if __name__ == '__main__':
     from waitress import serve
     if len(os.getenv('APP_SECRET','')) < 32 or not os.getenv('ADMIN_PASSWORD'): raise SystemExit('APP_SECRET（至少32字符）和 ADMIN_PASSWORD 为必填项')
     serve(create_app(), host='0.0.0.0', port=int(os.getenv('PORT','8000')))
+

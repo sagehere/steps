@@ -32,8 +32,64 @@ class AppTests(unittest.TestCase):
         with self.assertRaises(ValueError): parse_steps('0')
         with self.assertRaises(ValueError): parse_random_range('5', '3')
         with self.assertRaises(ValueError): parse_proxy_url('http://127.0.0.1:1080')
-        for name in ('login_access_token', 'grant_login_tokens', 'grant_app_token', 'check_app_token', 'renew_login_token', 'get_user_device_id', 'post_fake_brand_data'):
+        for name in ('login_access_token', 'grant_login_tokens', 'grant_app_token', 'check_app_token', 'renew_login_token', 'get_user_device_id', 'get_device_list', 'bind_virtual_device', 'post_fake_brand_data'):
             self.assertIn('client', inspect.signature(getattr(zepp_helper, name)).parameters)
+    def test_toolbox_device_list_and_virtual_bind_requests(self):
+        client = MagicMock(); response = MagicMock(status_code=200); response.json.return_value = {'code': 1, 'data': [{'deviceid': 'AABB'}]}; client.get.return_value = response
+        self.assertEqual(zepp_helper.get_device_list('token', 'user', client=client), [{'deviceid': 'AABB'}])
+        self.assertEqual(client.get.call_args.kwargs['headers']['apptoken'], 'token')
+        response.json.return_value = {'code': 1, 'data': []}; self.assertEqual(zepp_helper.get_device_list('token', 'user', client=client), [])
+        response.json.return_value = {'code': 0, 'data': []}
+        with self.assertRaisesRegex(ValueError, '设备列表请求失败'): zepp_helper.get_device_list('token', 'user', client=client)
+        response.status_code = 503
+        with self.assertRaisesRegex(ValueError, 'HTTP 503'): zepp_helper.get_device_list('token', 'user', client=client)
+        response.status_code = 200; response.json.return_value = {'code': 1}; client.post.return_value = response
+        zepp_helper.bind_virtual_device('token', 'user', 'AA:BB:CC:DD:EE:FF', '0123456789ABCDEF', client=client)
+        data = client.post.call_args.kwargs['data']
+        self.assertEqual({key: data[key] for key in ('productId', 'productVersion', 'device_source', 'device_type', 'activeStatus', 'brand')}, {'productId': '61', 'productVersion': '256', 'device_source': '58', 'device_type': '0', 'activeStatus': '0', 'brand': 'XiaoMi'})
+        self.assertNotIn('auth_key', data)
+        response.json.return_value = {'message': 'success'}
+        self.assertEqual(zepp_helper.post_fake_brand_data('123', 'token', 'user', '0123456789ABCDEF', client=client), (True, 'success'))
+        payload = client.post.call_args.kwargs['data']
+        self.assertIn('last_deviceid=0123456789ABCDEF', payload); self.assertIn('%22did%22%3A%220123456789ABCDEF%22', payload)
+    def test_virtual_binding_uses_persistent_identity_and_real_device(self):
+        app = self.app.application; store = app.extensions['store']; runner = app.extensions['runner']
+        with store.conn() as c:
+            c.execute("INSERT INTO accounts(username,secret,token_secret,created_at,updated_at) VALUES(?,?,?,?,?)", ('device@example.com', store.seal({'username': 'device@example.com', 'password': 'p'}), store.seal({}), utcnow(), utcnow()))
+            account_id = c.execute('SELECT id FROM accounts').fetchone()[0]
+        task = {'account_id': account_id, 'trigger': '手动', 'target_steps': 123}
+        def authenticate(account, client): return 'token', 'user', runner.credentials(account)[1]
+        with patch.object(runner, 'authenticate', side_effect=authenticate), patch.object(zepp_helper, 'get_device_list', return_value=[]), patch.object(zepp_helper, 'bind_virtual_device') as bind, patch.object(zepp_helper, 'post_fake_brand_data', return_value=(True, 'success')) as post:
+            self.assertEqual(runner.execute(task)[:2], (True, '提交成功'))
+            self.assertEqual(runner.execute(task)[:2], (True, '提交成功'))
+        first_id, second_id = bind.call_args_list[0].args[3], bind.call_args_list[1].args[3]
+        self.assertEqual(first_id, second_id); self.assertRegex(first_id, r'^[0-9A-F]{16}$')
+        self.assertEqual(post.call_args_list[0].args[3], first_id); self.assertEqual(post.call_args_list[1].args[3], first_id)
+        with store.conn() as c: tokens = store.open(c.execute('SELECT token_secret FROM accounts WHERE id=?', (account_id,)).fetchone()[0])
+        self.assertEqual(tokens['virtual_device_id'], first_id); self.assertRegex(tokens['virtual_device_mac'], r'^(?:[0-9A-F]{2}:){5}[0-9A-F]{2}$')
+        with patch.object(runner, 'authenticate', side_effect=authenticate), patch.object(zepp_helper, 'get_device_list', return_value=[{'deviceid': 'aa:bb'}]), patch.object(zepp_helper, 'bind_virtual_device') as bind, patch.object(zepp_helper, 'post_fake_brand_data', return_value=(True, 'success')) as post:
+            self.assertEqual(runner.execute(task)[:2], (True, '提交成功'))
+        bind.assert_not_called(); self.assertEqual(post.call_args.args[3], 'AABB')
+    def test_virtual_bind_failure_falls_back_and_test_never_binds(self):
+        app = self.app.application; store = app.extensions['store']; runner = app.extensions['runner']
+        with store.conn() as c:
+            c.execute("INSERT INTO accounts(username,secret,token_secret,created_at,updated_at) VALUES(?,?,?,?,?)", ('fallback@example.com', store.seal({'username': 'fallback@example.com', 'password': 'p'}), store.seal({}), utcnow(), utcnow()))
+            account_id = c.execute('SELECT id FROM accounts').fetchone()[0]
+        def authenticate(account, client): return 'token', 'user', runner.credentials(account)[1]
+        task = {'account_id': account_id, 'trigger': '手动', 'target_steps': 123}
+        with patch.object(runner, 'authenticate', side_effect=authenticate), patch.object(zepp_helper, 'get_device_list', return_value=[]), patch.object(zepp_helper, 'bind_virtual_device', side_effect=ValueError('自动绑定失败')), patch.object(zepp_helper, 'post_fake_brand_data', return_value=(True, 'success')) as post:
+            ok, message, _ = runner.execute(task)
+        self.assertTrue(ok); self.assertIn('自动绑定失败，已使用 fallback device', message); self.assertEqual(post.call_args.args[3], 'DA932FFFFE8816E7')
+        with patch.object(runner, 'authenticate', side_effect=authenticate), patch.object(zepp_helper, 'get_device_list', side_effect=ValueError('设备列表请求异常：HTTP 503')), patch.object(zepp_helper, 'bind_virtual_device') as bind, patch.object(zepp_helper, 'post_fake_brand_data', return_value=(True, 'success')) as post:
+            ok, message, _ = runner.execute(task)
+        self.assertTrue(ok); self.assertIn('设备查询失败，已使用 fallback device', message); self.assertEqual(post.call_args.args[3], 'DA932FFFFE8816E7'); bind.assert_not_called()
+        test_task = {**task, 'trigger': '测试'}
+        with patch.object(runner, 'authenticate', side_effect=authenticate), patch.object(zepp_helper, 'get_device_list', return_value=[]), patch.object(zepp_helper, 'bind_virtual_device') as bind, patch.object(zepp_helper, 'post_fake_brand_data') as post:
+            self.assertEqual(runner.execute(test_task)[:2], (True, '登录成功，当前账户尚无绑定设备'))
+        bind.assert_not_called(); post.assert_not_called()
+        with patch.object(runner, 'authenticate', side_effect=authenticate), patch.object(zepp_helper, 'get_device_list', side_effect=ValueError('设备列表请求异常：HTTP 503')):
+            ok, message, _ = runner.execute(test_task)
+        self.assertFalse(ok); self.assertIn('设备列表请求异常：HTTP 503', message)
     def test_encrypted_backup_restores_with_a_new_app_secret(self):
         self.login(); csrf = self.csrf()
         app, store = self.app.application, self.app.application.extensions['store']
@@ -458,3 +514,4 @@ class DashboardAndAuthTests(unittest.TestCase):
 
 
 if __name__ == '__main__': unittest.main()
+

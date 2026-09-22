@@ -266,6 +266,63 @@ def get_user_device_id(app_token, userid, client=requests) -> str | None:
     return None
 
 
+def get_device_list(app_token, userid, client=requests) -> list[dict]:
+    """Return the toolbox device-list response, or raise a safe request error."""
+    url = "https://api-mifit-cn.huami.com/v1/device/lists.json"
+    now = int(time.time())
+    params = {
+        "t": now, "callid": now, "userid": userid, "device": "android_35",
+        "device_type": "android_phone", "enableMultiDevice": "false", "v": "2.0",
+        "lang": "zh_CN", "channel": "Normal", "country": "CN",
+        "timezone": "Asia/Shanghai", "cv": "50813_6.14.0",
+    }
+    headers = {"apptoken": app_token, "User-Agent": "MiFit6.14.0 (2211133C; Android 15; Density/2.75)"}
+    try:
+        response = client.get(url, params=params, headers=headers, timeout=10)
+    except requests.RequestException as exc:
+        raise ValueError("设备列表请求异常：%s" % type(exc).__name__) from exc
+    if response.status_code != 200:
+        raise ValueError("设备列表请求异常：HTTP %d" % response.status_code)
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        raise ValueError("设备列表响应无效") from exc
+    if not isinstance(payload, dict) or payload.get("code") != 1 or not isinstance(payload.get("data"), list):
+        raise ValueError("设备列表请求失败")
+    if any(not isinstance(item, dict) for item in payload["data"]):
+        raise ValueError("设备列表响应无效")
+    return payload["data"]
+
+
+def bind_virtual_device(app_token, userid, device_mac, device_id, client=requests):
+    """Create the inactive Mi Band 5 NFC record used by toolbox."""
+    url = "https://api-mifit-cn.huami.com/v1/device/binds.json"
+    now = int(time.time())
+    data = {
+        "app_time": now, "code": "0", "activeStatus": "0", "bind_timezone": "32",
+        "device_type": "0", "crcedUserId": "0", "userid": userid, "device": "android_29",
+        "deviceid": device_id, "enableMultiDevice": "true", "mac": device_mac,
+        "productVersion": "256", "brandType": "-1", "productId": "61", "device_source": "58",
+        "brand": "XiaoMi", "fw_version": "V1.0.0.04", "hardwareVersion": "V0.44.131.18",
+        "soft_version": "6.13.1", "sys_model": "Xiaomi 10 Pro", "sys_version": "Android_35",
+        "v": "2.0", "lang": "zh_CN", "channel": "Normal", "country": "CN",
+        "timezone": "Asia/Shanghai", "cv": "50813_6.14.0",
+    }
+    headers = {"apptoken": app_token, "User-Agent": "MiFit6.14.0 (2211133C; Android 15; Density/2.75)"}
+    try:
+        response = client.post(url, data=data, headers=headers, timeout=10)
+    except requests.RequestException as exc:
+        raise ValueError("自动绑定请求异常：%s" % type(exc).__name__) from exc
+    if response.status_code != 200:
+        raise ValueError("自动绑定请求异常：HTTP %d" % response.status_code)
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        raise ValueError("自动绑定响应无效") from exc
+    if not isinstance(payload, dict) or payload.get("code") != 1:
+        raise ValueError("自动绑定失败")
+
+
 def post_fake_brand_data(step, app_token, userid, device_id=None, client=requests):
     t = get_time()
 
@@ -300,3 +357,4 @@ def post_fake_brand_data(step, app_token, userid, device_id=None, client=request
         return True, message
     else:
         return False, message
+
