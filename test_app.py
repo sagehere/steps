@@ -162,11 +162,12 @@ class AppTests(unittest.TestCase):
 
     def test_history_uses_configured_timezone(self):
         self.login(); app = self.app.application
+        timestamp = utcnow()
         with app.extensions['store'].conn() as c:
-            c.execute("INSERT INTO tasks(account_label,trigger,state,available_at,created_at) VALUES('***','测试','success',?,?)", ('2026-09-02T00:00:00', '2026-09-02T00:00:00'))
+            c.execute("INSERT INTO tasks(account_label,trigger,state,available_at,created_at) VALUES('***','测试','success',?,?)", (timestamp, timestamp))
         page = self.app.get('/history').data.decode()
         self.assertIn('时间（Asia/Shanghai）', page)
-        self.assertIn('2026-09-02 08:00:00', page)
+        self.assertIn(localtime(timestamp, 'Asia/Shanghai'), page)
 
     def test_bulk_plan_assignment_and_unassignment(self):
         self.login(); app = self.app.application
@@ -514,4 +515,5 @@ class DashboardAndAuthTests(unittest.TestCase):
 
 
 if __name__ == '__main__': unittest.main()
+
 
